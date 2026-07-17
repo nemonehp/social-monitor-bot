@@ -1,0 +1,4 @@
+# Поддерживаемые примеры
+http://user:password@host:port
+socks5://user:password@host:port
+host:port:user:password

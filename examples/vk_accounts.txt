@@ -1,0 +1,2 @@
+# Один токен на строку или label;token
+vk-main;PASTE_TOKEN_HERE
