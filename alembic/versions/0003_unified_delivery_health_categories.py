@@ -1,6 +1,6 @@
 """Unified delivery, credential health and source categories.
 
-Revision ID: 0003_unified_delivery_health_categories
+Revision ID: 0003_unified_health_categories
 Revises: 0002_checkpoint_monitoring
 """
 
@@ -8,7 +8,7 @@ import sqlalchemy as sa
 
 from alembic import op
 
-revision = "0003_unified_delivery_health_categories"
+revision = "0003_unified_health_categories"
 down_revision = "0002_checkpoint_monitoring"
 branch_labels = None
 depends_on = None

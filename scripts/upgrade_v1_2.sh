@@ -3,7 +3,7 @@ set -Eeuo pipefail
 
 PROJECT_DIR="${PROJECT_DIR:-/opt/social-monitor/app}"
 BACKUP_DIR="${BACKUP_DIR:-/opt/social-monitor/backups}"
-EXPECTED_REVISION="0003_unified_delivery_health_categories"
+EXPECTED_REVISION="0003_unified_health_categories"
 
 cd "$PROJECT_DIR"
 

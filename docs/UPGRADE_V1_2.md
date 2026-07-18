@@ -16,7 +16,7 @@
 
 ## Миграция
 
-Миграция `0003_unified_delivery_health_categories` не удаляет источники, публикации, доставки, аккаунты, токены, Telegram-сессии или прокси. Она добавляет категории и поля состояния здоровья.
+Миграция `0003_unified_health_categories` не удаляет источники, публикации, доставки, аккаунты, токены, Telegram-сессии или прокси. Она добавляет категории и поля состояния здоровья.
 
 ## Обновление production
 
@@ -36,4 +36,4 @@ docker compose exec -T postgres sh -lc \
 docker compose logs --since=10m --tail=300 scheduler worker-tg worker-vk delivery bot
 ```
 
-Ожидаемая ревизия: `0003_unified_delivery_health_categories`.
+Ожидаемая ревизия: `0003_unified_health_categories`.
