@@ -57,6 +57,7 @@ class Source(Base, TimestampMixin):
         UniqueConstraint("platform", "normalized_link", name="uq_sources_platform_link"),
         Index("ix_sources_due", "status", "next_check_at"),
         Index("ix_sources_region", "region"),
+        Index("ix_sources_category", "category", "subcategory"),
     )
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
@@ -67,6 +68,8 @@ class Source(Base, TimestampMixin):
     title: Mapped[str] = mapped_column(String(500), default="", nullable=False)
     region: Mapped[str] = mapped_column(String(255), default="", nullable=False)
     federal_district: Mapped[str] = mapped_column(String(255), default="", nullable=False)
+    category: Mapped[str] = mapped_column(String(255), default="", nullable=False)
+    subcategory: Mapped[str] = mapped_column(String(255), default="", nullable=False)
     status: Mapped[SourceStatus] = mapped_column(
         Enum(SourceStatus, name="source_status_enum"), default=SourceStatus.ACTIVE, nullable=False
     )
@@ -212,6 +215,11 @@ class Credential(Base, TimestampMixin):
     last_success_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     last_error: Mapped[str] = mapped_column(Text, default="", nullable=False)
     requests_count: Mapped[int] = mapped_column(BigInteger, default=0, nullable=False)
+    last_health_check_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_health_ok_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    health_failures: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    dead_since: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    dead_notified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
 class Proxy(Base, TimestampMixin):
@@ -235,6 +243,7 @@ class Proxy(Base, TimestampMixin):
     failures: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     successes: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     last_check_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_success_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     quarantine_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     last_error: Mapped[str] = mapped_column(Text, default="", nullable=False)
 

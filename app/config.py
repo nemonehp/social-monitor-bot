@@ -22,17 +22,20 @@ class Settings(BaseSettings):
 
     vk_worker_concurrency: int = 6
     tg_max_active_accounts: int = 20
-    delivery_concurrency: int = 4
+    delivery_concurrency: int = 1
+    delivery_batch_size: int = 0
 
     vk_page_size: int = 100
     vk_max_pages_per_run: int = 20
     vk_per_token_min_interval_seconds: float = 0.35
     tg_batch_messages: int = 500
+    credential_health_probe_posts: int = 5
     collection_overlap_seconds: int = 120
     media_max_previews_per_item: int = 4
     media_max_preview_bytes: int = 2_000_000
     media_max_image_edge: int = 1280
-    media_retention_hours: int = 72
+    media_retention_hours: int = 24
+    media_delete_after_delivery: bool = True
     job_history_days: int = 7
     delivery_history_days: int = 30
 
@@ -41,8 +44,14 @@ class Settings(BaseSettings):
     proxy_failures_to_quarantine: int = 2
     proxy_failures_to_remove: int = 5
     proxy_quarantine_minutes: int = 15
-    proxy_low_watermark: int = 2
+    proxy_remove_after_hours: int = 3
+    proxy_low_ratio: float = 0.5
+    proxy_low_watermark: int = 1
     alert_cooldown_minutes: int = 30
+    health_alert_repeat_minutes: int = 360
+    limited_alert_threshold_seconds: int = 1800
+    daily_report_hour_moscow: int = 0
+    daily_report_top_sources: int = 5
 
     vk_api_version: str = "5.131"
     vk_api_base: str = "https://api.vk.com/method"

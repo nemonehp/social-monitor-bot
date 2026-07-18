@@ -5,7 +5,6 @@ import re
 from dataclasses import dataclass
 from urllib.parse import quote, urlparse
 
-
 SUPPORTED_SCHEMES = {"http", "https", "socks4", "socks5"}
 SCHEME_ALIASES = {"socks": "socks5", "socks5h": "socks5"}
 

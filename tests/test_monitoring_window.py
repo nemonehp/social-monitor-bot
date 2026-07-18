@@ -94,7 +94,7 @@ async def test_telegram_video_downloads_thumbnail_only(tmp_path):
 
         async def download_media(self, media, *, file, thumb):
             self.calls.append((media, file, thumb))
-            return b"preview"
+            return b"\xff\xd8\xffpreview"
 
     client = FakeClient()
     result = await collector._download_message_previews(client, "tg:test", [message])
@@ -102,7 +102,7 @@ async def test_telegram_video_downloads_thumbnail_only(tmp_path):
     assert len(result) == 1
     assert result[0].media_type == "video_preview"
     assert result[0].metadata["preview_only"] is True
-    assert client.calls == [(document, bytes, 0)]
+    assert client.calls == [(message, bytes, 0)]
 
 
 @pytest.mark.asyncio

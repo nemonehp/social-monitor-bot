@@ -4,9 +4,8 @@ Revision ID: 0001_initial
 Revises:
 """
 from alembic import op
-
-from app.db.base import Base
 from app.db import models
+from app.db.base import Base
 
 _models_loaded = models
 

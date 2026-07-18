@@ -1,13 +1,20 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import UTC, datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import structlog
 from aiogram import Bot
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
-from aiogram.exceptions import TelegramAPIError, TelegramBadRequest, TelegramForbiddenError, TelegramRetryAfter
+from aiogram.exceptions import (
+    TelegramAPIError,
+    TelegramBadRequest,
+    TelegramForbiddenError,
+    TelegramRetryAfter,
+)
 from aiogram.types import (
     FSInputFile,
     InlineKeyboardButton,
@@ -23,9 +30,11 @@ from app.db.models import Delivery, Media
 from app.db.repositories import DeliveryRepository
 from app.db.session import SessionFactory
 from app.services.alerts import AlertService
+from app.services.media_cleanup import cleanup_item_media
 from app.utils.text import h
 
 logger = structlog.get_logger()
+MOSCOW = ZoneInfo("Europe/Moscow")
 
 
 class DeliveryWorker:
@@ -51,10 +60,24 @@ class DeliveryWorker:
     def _header(cls, delivery: Delivery, body_limit: int = 3000) -> str:
         item = delivery.item
         source = item.source
-        kind = "НОВАЯ ИСТОРИЯ" if item.item_type == ItemType.STORY else "НОВЫЙ ПОСТ"
-        platform = "VK" if item.platform.value == "vk" else "TELEGRAM"
-        location = " · ".join(x for x in [source.region, source.federal_district] if x)
-        parts = [f"<b>{platform} · {kind}</b>", "", f"<b>{h(source.title or source.normalized_link)}</b>"]
+        kind = "ИСТОРИЯ" if item.item_type == ItemType.STORY else "ПОСТ"
+        platform_icon = "🟦" if item.platform.value == "vk" else "✈️"
+        published = item.published_at or item.created_at or datetime.now(UTC)
+        if published.tzinfo is None:
+            published = published.replace(tzinfo=UTC)
+        published_text = published.astimezone(MOSCOW).strftime("%d.%m.%Y %H:%M")
+        parts = [f"<b>{platform_icon} · {kind} · {published_text}</b>"]
+        title = source.title or source.normalized_link
+        if title:
+            parts.extend(["", f"<b>{h(title)}</b>"])
+        location = " · ".join(
+            value
+            for value in [
+                getattr(source, "subcategory", "") or source.region,
+                getattr(source, "category", "") or source.federal_district,
+            ]
+            if value
+        )
         if location:
             parts.append(h(location))
         if item.text:
@@ -106,13 +129,12 @@ class DeliveryWorker:
         if len(media) == 1:
             row = media[0]
             file = FSInputFile(row.local_path)
-            caption = caption_text
             try:
                 if row.media_type == "video":
                     message = await self.bot.send_video(
                         delivery.target_chat_id,
                         video=file,
-                        caption=caption,
+                        caption=caption_text,
                         reply_markup=keyboard,
                         supports_streaming=True,
                     )
@@ -120,14 +142,14 @@ class DeliveryWorker:
                     message = await self.bot.send_document(
                         delivery.target_chat_id,
                         document=file,
-                        caption=caption,
+                        caption=caption_text,
                         reply_markup=keyboard,
                     )
                 else:
                     message = await self.bot.send_photo(
                         delivery.target_chat_id,
                         photo=file,
-                        caption=caption,
+                        caption=caption_text,
                         reply_markup=keyboard,
                     )
                 message_ids.append(message.message_id)
@@ -149,7 +171,11 @@ class DeliveryWorker:
                 )
                 return [message.message_id]
 
-        visual = [row for row in media if row.media_type in {"photo", "video", "video_preview", "link_preview"}]
+        visual = [
+            row
+            for row in media
+            if row.media_type in {"photo", "video", "video_preview", "document_preview", "link_preview"}
+        ]
         documents = [row for row in media if row not in visual]
         try:
             for compatible_group in (visual, documents):
@@ -159,7 +185,6 @@ class DeliveryWorker:
                     sent = await self.bot.send_media_group(delivery.target_chat_id, media=group)
                     message_ids.extend(message.message_id for message in sent)
         except TelegramBadRequest as exc:
-            # A malformed/unsupported attachment must never suppress the information signal.
             logger.warning("delivery_media_fallback", delivery_id=delivery.id, error=str(exc))
         card = await self.bot.send_message(
             delivery.target_chat_id,
@@ -170,85 +195,102 @@ class DeliveryWorker:
         message_ids.append(card.message_id)
         return message_ids
 
-    async def slot(self, slot: int) -> None:
-        while True:
-            delivery = None
-            try:
-                async with SessionFactory() as session:
-                    async with session.begin():
-                        delivery = await DeliveryRepository.claim(
-                            session, lease_seconds=self.settings.job_lease_seconds
-                        )
-                if not delivery:
-                    await asyncio.sleep(0.5)
-                    continue
-                message_ids = await self._send(delivery)
-                async with SessionFactory() as session:
-                    async with session.begin():
-                        await DeliveryRepository.sent(session, delivery.id, message_ids)
-                await self.alerts.send_stateful(
-                    "signal_chat_unavailable",
-                    active=False,
-                    active_text="",
-                    recovery_text="✅ Доставка в сигнальный чат восстановлена.",
-                    payload={"chat_id": delivery.target_chat_id},
-                )
-                logger.info("delivery_sent", delivery_id=delivery.id, message_ids=message_ids)
-            except TelegramRetryAfter as exc:
-                if delivery:
-                    async with SessionFactory() as session:
-                        async with session.begin():
-                            await DeliveryRepository.retry(
-                                session,
-                                delivery.id,
-                                str(exc),
-                                delay_seconds=int(exc.retry_after) + 1,
-                            )
-            except TelegramForbiddenError as exc:
-                if delivery:
-                    async with SessionFactory() as session:
-                        async with session.begin():
-                            await DeliveryRepository.retry(
-                                session,
-                                delivery.id,
-                                str(exc),
-                                delay_seconds=300,
-                            )
-                    await self.alerts.send_stateful(
-                        "signal_chat_unavailable",
-                        active=True,
-                        active_text=(
-                            "⚠️ <b>Сигнальный чат недоступен</b>\n\n"
-                            "Проверьте, что бот добавлен в чат и может отправлять сообщения и медиа."
-                        ),
-                        recovery_text="",
-                        payload={"chat_id": delivery.target_chat_id, "error": str(exc)},
+    async def _process_delivery(self, delivery: Delivery) -> tuple[bool, int]:
+        try:
+            message_ids = await self._send(delivery)
+            async with SessionFactory() as session:
+                async with session.begin():
+                    await DeliveryRepository.sent(session, delivery.id, message_ids)
+            if self.settings.media_delete_after_delivery:
+                removed = await cleanup_item_media(delivery.item_id)
+                if removed:
+                    logger.info("delivery_media_deleted", item_id=delivery.item_id, removed=removed)
+            await self.alerts.send_stateful(
+                "signal_chat_unavailable",
+                active=False,
+                active_text="",
+                payload={"chat_id": delivery.target_chat_id},
+            )
+            logger.info("delivery_sent", delivery_id=delivery.id, message_ids=message_ids)
+            return True, 0
+        except TelegramRetryAfter as exc:
+            delay = int(exc.retry_after) + 1
+            async with SessionFactory() as session:
+                async with session.begin():
+                    await DeliveryRepository.retry(session, delivery.id, str(exc), delay_seconds=delay)
+            return False, delay
+        except TelegramForbiddenError as exc:
+            async with SessionFactory() as session:
+                async with session.begin():
+                    await DeliveryRepository.retry(session, delivery.id, str(exc), delay_seconds=300)
+            await self.alerts.send_stateful(
+                "signal_chat_unavailable",
+                active=True,
+                active_text=(
+                    "⚠️ <b>Сигнальный чат недоступен</b>\n\n"
+                    "Проверьте, что бот добавлен в чат и может отправлять сообщения и медиа."
+                ),
+                payload={"chat_id": delivery.target_chat_id, "error": str(exc)},
+                repeat_while_active=True,
+                cooldown_minutes=self.settings.health_alert_repeat_minutes,
+            )
+            logger.warning("signal_chat_unavailable", delivery_id=delivery.id, error=str(exc))
+            return False, 300
+        except TelegramAPIError as exc:
+            final = delivery.attempts >= self.settings.max_job_attempts
+            delay = min(600, 2 ** min(9, delivery.attempts))
+            async with SessionFactory() as session:
+                async with session.begin():
+                    await DeliveryRepository.retry(
+                        session,
+                        delivery.id,
+                        str(exc),
+                        delay_seconds=delay,
+                        final=final,
                     )
-                logger.warning("signal_chat_unavailable", delivery_id=getattr(delivery, "id", None), error=str(exc))
-            except TelegramAPIError as exc:
-                if delivery:
-                    async with SessionFactory() as session:
-                        async with session.begin():
-                            final = delivery.attempts >= self.settings.max_job_attempts
-                            await DeliveryRepository.retry(
-                                session,
-                                delivery.id,
-                                str(exc),
-                                delay_seconds=min(600, 2 ** min(9, delivery.attempts)),
-                                final=final,
-                            )
-                logger.warning("delivery_api_error", delivery_id=getattr(delivery, "id", None), error=str(exc))
-            except Exception as exc:
-                logger.exception("delivery_unexpected", delivery_id=getattr(delivery, "id", None))
-                if delivery:
-                    async with SessionFactory() as session:
-                        async with session.begin():
-                            await DeliveryRepository.retry(session, delivery.id, str(exc), delay_seconds=30)
+            logger.warning("delivery_api_error", delivery_id=delivery.id, error=str(exc))
+            return False, delay
+        except Exception as exc:
+            logger.exception("delivery_unexpected", delivery_id=delivery.id)
+            async with SessionFactory() as session:
+                async with session.begin():
+                    await DeliveryRepository.retry(session, delivery.id, str(exc), delay_seconds=30)
+            return False, 30
 
     async def run(self) -> None:
-        try:
-            await asyncio.gather(
-                *(self.slot(i + 1) for i in range(self.settings.delivery_concurrency))
+        if self.settings.delivery_concurrency != 1:
+            logger.warning(
+                "delivery_concurrency_forced_to_one",
+                configured=self.settings.delivery_concurrency,
+                reason="source batches must never interleave",
             )
+        try:
+            while True:
+                async with SessionFactory() as session:
+                    async with session.begin():
+                        batch = await DeliveryRepository.claim_batch(
+                            session,
+                            lease_seconds=self.settings.job_lease_seconds,
+                            batch_size=self.settings.delivery_batch_size,
+                        )
+                if not batch:
+                    await asyncio.sleep(0.5)
+                    continue
+                logger.info(
+                    "delivery_batch_claimed",
+                    source_id=batch[0].item.source_id,
+                    target_chat_id=batch[0].target_chat_id,
+                    size=len(batch),
+                )
+                for index, delivery in enumerate(batch):
+                    success, delay = await self._process_delivery(delivery)
+                    if success:
+                        continue
+                    remaining = [row.id for row in batch[index + 1 :]]
+                    if remaining:
+                        async with SessionFactory() as session:
+                            async with session.begin():
+                                await DeliveryRepository.release(session, remaining, delay_seconds=delay)
+                    break
         finally:
             await self.bot.session.close()

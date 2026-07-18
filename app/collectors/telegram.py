@@ -7,6 +7,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from telethon import TelegramClient
+from telethon.utils import stripped_photo_to_jpg
 
 from app.collectors.errors import (
     AccessDeniedError,
@@ -152,6 +153,32 @@ class TelegramCollector:
         entity_id = str(getattr(entity, "id", ""))
         title = _title(entity)
         normalized_link = f"https://t.me/{getattr(entity, 'username', None) or username}"
+        probe_messages: list[Any] = []
+        probe_method = getattr(client, "get_messages", None)
+        if probe_method is not None:
+            try:
+                probe_messages = list(
+                    await probe_method(
+                        entity,
+                        limit=max(1, getattr(self.settings, "credential_health_probe_posts", 5)),
+                    )
+                )
+            except TypeError:
+                # Lightweight test doubles and old adapters may require an
+                # offset argument. Production Telethon clients support this call.
+                probe_messages = []
+            except Exception as exc:
+                raise _classify(exc) from exc
+        probe_messages = [message for message in probe_messages if getattr(message, "id", None)]
+        content_probe_ok = bool(probe_messages)
+        known_probe_match = False
+        if state and state.recent_post_keys:
+            known_ids = {
+                str(key).rsplit(":", 1)[-1]
+                for key in state.recent_post_keys
+                if ":msg:" in str(key)
+            }
+            known_probe_match = any(str(message.id) in known_ids for message in probe_messages)
         items: list[CollectedItem] = []
         needs_retry = False
         old_watermark = int(state.post_watermark or 0) if state and str(state.post_watermark).isdigit() else 0
@@ -298,6 +325,9 @@ class TelegramCollector:
                 "story_keys": story_keys[-20:],
                 "batch_continuation": needs_retry,
                 "story_needs_retry": story_needs_retry,
+                "credential_content_probe_ok": content_probe_ok,
+                "credential_known_post_match": known_probe_match,
+                "credential_probe_ids": [int(message.id) for message in probe_messages[:10]],
             },
         )
 
@@ -372,38 +402,89 @@ class TelegramCollector:
             },
         )
 
-    def _select_thumb(self, media: Any) -> Any | None:
-        sizes = list(getattr(media, "sizes", None) or getattr(media, "thumbs", None) or [])
-        if not sizes:
-            return None
-        measured: list[tuple[int, int, Any]] = []
+    def _thumb_candidates(self, media: Any) -> list[tuple[int, Any]]:
+        inner = getattr(media, "photo", None) or getattr(media, "document", None) or media
+        sizes = list(getattr(inner, "sizes", None) or getattr(inner, "thumbs", None) or [])
+        ranked: list[tuple[int, int, int, Any]] = []
         for index, size in enumerate(sizes):
             width = int(getattr(size, "w", 0) or 0)
             height = int(getattr(size, "h", 0) or 0)
-            if not width or not height:
-                continue
-            measured.append((width * height, max(width, height), index))
-        if not measured:
-            return 0
-        within_limit = [row for row in measured if row[1] <= self.settings.media_max_image_edge]
-        return max(within_limit or measured, key=lambda row: row[0])[2]
+            area = width * height
+            edge = max(width, height)
+            within = 1 if edge and edge <= self.settings.media_max_image_edge else 0
+            ranked.append((within, area, index, size))
+        ranked.sort(reverse=True, key=lambda row: (row[0], row[1], row[2]))
+        return [(index, size) for _within, _area, index, size in ranked]
 
-    async def _download_preview_bytes(self, client: TelegramClient, media: Any) -> bytes | None:
+    @staticmethod
+    def _is_image_bytes(data: bytes) -> bool:
+        return (
+            data.startswith(b"\xff\xd8\xff")
+            or data.startswith(b"\x89PNG\r\n\x1a\n")
+            or (len(data) > 12 and data[8:12] == b"WEBP")
+        )
+
+    async def _download_preview_bytes(
+        self,
+        client: TelegramClient,
+        media: Any,
+        *,
+        download_target: Any | None = None,
+    ) -> bytes | None:
         inner = getattr(media, "photo", None) or getattr(media, "document", None) or media
-        thumb = self._select_thumb(inner)
-        # Videos/documents are never downloaded without a thumbnail.
         is_photo = "Photo" in type(inner).__name__
-        if thumb is None and not is_photo:
-            return None
-        try:
-            data = await client.download_media(media, file=bytes, thumb=thumb)
-        except Exception:
-            return None
-        if not isinstance(data, (bytes, bytearray)) or not data:
-            return None
-        if len(data) > self.settings.media_max_preview_bytes:
-            return None
-        return bytes(data)
+        candidates = self._thumb_candidates(inner)
+
+        # Stripped thumbnails are embedded in the API response and are the most
+        # reliable fallback for Telegram videos whose CDN thumb cannot be fetched.
+        for _index, size in candidates:
+            raw = getattr(size, "bytes", None)
+            if raw and type(size).__name__ == "PhotoStrippedSize":
+                try:
+                    data = bytes(stripped_photo_to_jpg(raw))
+                except Exception:
+                    continue
+                if len(data) <= self.settings.media_max_preview_bytes and self._is_image_bytes(data):
+                    return data
+
+        target = download_target or media
+        thumb_indexes: list[int | None] = [index for index, _size in candidates]
+        if is_photo and not thumb_indexes:
+            thumb_indexes = [None]
+        # Try several known thumbnail sizes. Never call a document/video download
+        # without an explicit thumbnail, so full videos cannot reach the server.
+        for thumb in thumb_indexes:
+            if thumb is None and not is_photo:
+                continue
+            try:
+                data = await client.download_media(target, file=bytes, thumb=thumb)
+            except Exception:
+                continue
+            if not isinstance(data, (bytes, bytearray)) or not data:
+                continue
+            data = bytes(data)
+            if len(data) > self.settings.media_max_preview_bytes:
+                continue
+            if self._is_image_bytes(data):
+                return data
+        return None
+
+    @staticmethod
+    def _message_media(message: Any) -> tuple[Any | None, str]:
+        if getattr(message, "photo", None) is not None:
+            return message.photo, "photo"
+        if getattr(message, "video", None) is not None:
+            return getattr(message, "document", None) or message.video, "video_preview"
+        if getattr(message, "document", None) is not None:
+            return message.document, "document_preview"
+        media = getattr(message, "media", None)
+        webpage = getattr(media, "webpage", None)
+        if webpage is not None:
+            if getattr(webpage, "photo", None) is not None:
+                return webpage.photo, "link_preview"
+            if getattr(webpage, "document", None) is not None:
+                return webpage.document, "document_preview"
+        return None, ""
 
     async def _download_message_previews(
         self,
@@ -417,16 +498,14 @@ class TelegramCollector:
         for message in messages:
             if len(result) >= self.settings.media_max_previews_per_item:
                 break
-            media_obj = getattr(message, "photo", None) or getattr(message, "document", None)
+            media_obj, media_type = self._message_media(message)
             if media_obj is None:
                 continue
-            if getattr(message, "photo", None):
-                media_type = "photo"
-            elif getattr(message, "video", None):
-                media_type = "video_preview"
-            else:
-                media_type = "document_preview"
-            data = await self._download_preview_bytes(client, media_obj)
+            data = await self._download_preview_bytes(
+                client,
+                media_obj,
+                download_target=message,
+            )
             if not data:
                 continue
             target_dir.mkdir(parents=True, exist_ok=True)
@@ -437,7 +516,10 @@ class TelegramCollector:
                     media_type=media_type,
                     local_path=str(path),
                     mime_type="image/jpeg",
-                    metadata={"message_id": int(getattr(message, "id", 0) or 0), "preview_only": True},
+                    metadata={
+                        "message_id": int(getattr(message, "id", 0) or 0),
+                        "preview_only": True,
+                    },
                 )
             )
         return result

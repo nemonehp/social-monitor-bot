@@ -20,7 +20,7 @@ cd "$PROJECT_DIR"
 
 mkdir -p "$BACKUP_DIR"
 stamp="$(date -u +%Y%m%dT%H%M%SZ)"
-backup="$BACKUP_DIR/pre-v1.1.0-$stamp.dump"
+backup="$BACKUP_DIR/pre-v1.1.1-$stamp.dump"
 
 echo "[1/7] PostgreSQL backup: $backup"
 docker compose exec -T postgres \

@@ -6,6 +6,9 @@ import socket
 from dataclasses import dataclass
 
 import structlog
+from aiogram import Bot
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode
 
 from app.collectors.errors import (
     AccessDeniedError,
@@ -19,6 +22,7 @@ from app.collectors.errors import (
 from app.collectors.vk import VkCollector
 from app.config import Settings
 from app.db.enums import CredentialPlatform, Platform
+from app.db.models import Credential
 from app.db.repositories import (
     CredentialRepository,
     JobRepository,
@@ -27,6 +31,7 @@ from app.db.repositories import (
 )
 from app.db.session import SessionFactory
 from app.security import SecretBox
+from app.services.alerts import AlertService
 from app.workers.common import keep_job_lease, persist_collection_result
 
 logger = structlog.get_logger()
@@ -88,6 +93,21 @@ class VkWorker:
         self.credentials = RotatingPool()
         self.proxies = RotatingPool()
         self.worker_id = f"vk-{socket.gethostname()}"
+        self.alert_bot = Bot(
+            settings.bot_token,
+            default=DefaultBotProperties(parse_mode=ParseMode.HTML),
+        )
+        self.alerts = AlertService(self.alert_bot, settings)
+
+    async def _mark_dead_and_alert(self, credential_id: int, error: str) -> None:
+        credential_row = None
+        transitioned = False
+        async with SessionFactory() as session:
+            async with session.begin():
+                transitioned = await CredentialRepository.mark_dead(session, credential_id, error)
+                credential_row = await session.get(Credential, credential_id)
+        if transitioned and credential_row:
+            await self.alerts.send_dead_credential(credential_row)
 
     async def refresh_pools(self) -> None:
         async with SessionFactory() as session:
@@ -159,7 +179,13 @@ class VkWorker:
                                 await JobRepository.complete(session, job_id)
                                 continue
                             inserted, deliveries = await persist_collection_result(session, source, result)
-                            await CredentialRepository.mark_success(session, credential.id)
+                            await CredentialRepository.mark_success(
+                                session,
+                                credential.id,
+                                health_verified=bool(
+                                    result.diagnostics.get("credential_content_probe_ok")
+                                ),
+                            )
                             await ProxyRepository.mark_success(session, proxy.id)
                             if result.needs_immediate_retry:
                                 await JobRepository.retry(
@@ -180,9 +206,9 @@ class VkWorker:
                 )
 
             except CredentialDeadError as exc:
+                await self._mark_dead_and_alert(credential.id, str(exc))
                 async with SessionFactory() as session:
                     async with session.begin():
-                        await CredentialRepository.mark_dead(session, credential.id, str(exc))
                         if job_id:
                             await JobRepository.retry(session, job_id, str(exc), delay_seconds=3)
                 await self.credentials.discard(credential)
@@ -192,7 +218,13 @@ class VkWorker:
                 delay = max(2, exc.retry_after) + random.randint(0, 3)
                 async with SessionFactory() as session:
                     async with session.begin():
-                        await CredentialRepository.cooldown(session, credential.id, delay, str(exc))
+                        await CredentialRepository.cooldown(
+                            session,
+                            credential.id,
+                            delay,
+                            str(exc),
+                            limited=delay >= self.settings.limited_alert_threshold_seconds,
+                        )
                         if job_id:
                             await JobRepository.retry(session, job_id, str(exc), delay_seconds=delay)
                 await self.credentials.discard(credential)
@@ -207,7 +239,8 @@ class VkWorker:
                             quarantine_after=self.settings.proxy_failures_to_quarantine,
                             remove_after=self.settings.proxy_failures_to_remove,
                             quarantine_minutes=self.settings.proxy_quarantine_minutes,
-                            immediate_remove=isinstance(exc, ProxyUnavailableError),
+                            remove_after_hours=self.settings.proxy_remove_after_hours,
+                            immediate_remove=False,
                         )
                         if job_id:
                             final = bool(job and job.attempts >= self.settings.max_job_attempts)
@@ -282,4 +315,7 @@ class VkWorker:
             asyncio.create_task(self.run_slot(i + 1))
             for i in range(self.settings.vk_worker_concurrency)
         )
-        await asyncio.gather(*tasks)
+        try:
+            await asyncio.gather(*tasks)
+        finally:
+            await self.alert_bot.session.close()

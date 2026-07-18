@@ -14,3 +14,5 @@ def test_user_table_columns(tmp_path: Path):
     assert len(preview.candidates) == 2
     assert {x.platform.value for x in preview.candidates} == {"vk", "telegram"}
     assert all(x.federal_district == "ДФО" for x in preview.candidates)
+    assert all(x.category == "ДФО" for x in preview.candidates)
+    assert all(x.subcategory == "Амурская область" for x in preview.candidates)

@@ -5,6 +5,9 @@ import json
 import socket
 
 import structlog
+from aiogram import Bot
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode
 from telethon import TelegramClient
 from telethon.sessions import StringSession
 
@@ -22,6 +25,7 @@ from app.db.models import Credential
 from app.db.repositories import CredentialRepository, JobRepository, SourceRepository
 from app.db.session import SessionFactory
 from app.security import SecretBox
+from app.services.alerts import AlertService
 from app.services.network import check_direct_ip
 from app.workers.common import keep_job_lease, persist_collection_result
 
@@ -34,6 +38,21 @@ class TgWorker:
         self.secret_box = SecretBox(settings.app_encryption_key)
         self.collector = TelegramCollector(settings)
         self.worker_id = f"tg-{socket.gethostname()}"
+        self.alert_bot = Bot(
+            settings.bot_token,
+            default=DefaultBotProperties(parse_mode=ParseMode.HTML),
+        )
+        self.alerts = AlertService(self.alert_bot, settings)
+
+    async def _mark_dead_and_alert(self, credential_id: int, error: str) -> None:
+        credential_row = None
+        transitioned = False
+        async with SessionFactory() as session:
+            async with session.begin():
+                transitioned = await CredentialRepository.mark_dead(session, credential_id, error)
+                credential_row = await session.get(Credential, credential_id)
+        if transitioned and credential_row:
+            await self.alerts.send_dead_credential(credential_row)
 
     async def start_client(self, credential: Credential) -> TelegramClient:
         config = credential.config_json or {}
@@ -98,7 +117,13 @@ class TgWorker:
                                     await JobRepository.complete(session, job.id)
                                     continue
                                 inserted, deliveries = await persist_collection_result(session, source, result)
-                                await CredentialRepository.mark_success(session, credential.id)
+                                await CredentialRepository.mark_success(
+                                    session,
+                                    credential.id,
+                                    health_verified=bool(
+                                        result.diagnostics.get("credential_content_probe_ok")
+                                    ),
+                                )
                                 if result.needs_immediate_retry:
                                     await JobRepository.retry(
                                         session,
@@ -119,15 +144,21 @@ class TgWorker:
                     delay = max(5, exc.retry_after)
                     async with SessionFactory() as session:
                         async with session.begin():
-                            await CredentialRepository.cooldown(session, credential.id, delay, str(exc))
+                            await CredentialRepository.cooldown(
+                                session,
+                                credential.id,
+                                delay,
+                                str(exc),
+                                limited=delay >= self.settings.limited_alert_threshold_seconds,
+                            )
                             if job_id:
                                 await JobRepository.retry(session, job_id, str(exc), delay_seconds=delay)
                     logger.warning("tg_flood_wait", credential_id=credential.id, delay=delay)
                     return
                 except CredentialDeadError as exc:
+                    await self._mark_dead_and_alert(credential.id, str(exc))
                     async with SessionFactory() as session:
                         async with session.begin():
-                            await CredentialRepository.mark_dead(session, credential.id, str(exc))
                             if job_id:
                                 await JobRepository.retry(session, job_id, str(exc), delay_seconds=3)
                     logger.warning("tg_credential_dead", credential_id=credential.id, error=str(exc))
@@ -177,9 +208,7 @@ class TgWorker:
                             if job_id:
                                 await JobRepository.retry(session, job_id, str(exc), delay_seconds=30)
         except CredentialDeadError as exc:
-            async with SessionFactory() as session:
-                async with session.begin():
-                    await CredentialRepository.mark_dead(session, credential.id, str(exc))
+            await self._mark_dead_and_alert(credential.id, str(exc))
         except Exception as exc:
             logger.exception("tg_account_start_failed", credential_id=credential.id)
             async with SessionFactory() as session:
@@ -193,44 +222,51 @@ class TgWorker:
         tasks: dict[int, asyncio.Task] = {}
         next_ip_check = 0.0
         direct_route_ok = not self.settings.tg_require_non_ru
-        while True:
-            loop = asyncio.get_running_loop()
-            if self.settings.tg_require_non_ru and loop.time() >= next_ip_check:
-                next_ip_check = loop.time() + 300
-                try:
-                    ip_info = await check_direct_ip(self.settings.ip_check_url)
-                    direct_route_ok = ip_info.country_code != "RU"
-                    if not direct_route_ok:
-                        logger.error("telegram_direct_ip_is_ru", ip=ip_info.ip)
-                except Exception:
-                    direct_route_ok = False
-                    logger.exception("telegram_ip_check_failed")
-                if not direct_route_ok and tasks:
-                    for task in tasks.values():
-                        task.cancel()
-                    await asyncio.gather(*tasks.values(), return_exceptions=True)
-                    tasks.clear()
-            if not direct_route_ok:
-                await asyncio.sleep(30)
-                continue
-            for credential_id, task in list(tasks.items()):
-                if task.done():
+        try:
+            while True:
+                loop = asyncio.get_running_loop()
+                if self.settings.tg_require_non_ru and loop.time() >= next_ip_check:
+                    next_ip_check = loop.time() + 300
                     try:
-                        task.result()
+                        ip_info = await check_direct_ip(self.settings.ip_check_url)
+                        direct_route_ok = ip_info.country_code != "RU"
+                        if not direct_route_ok:
+                            logger.error("telegram_direct_ip_is_ru", ip=ip_info.ip)
                     except Exception:
-                        logger.exception("tg_account_task_failed", credential_id=credential_id)
-                    tasks.pop(credential_id, None)
-            async with SessionFactory() as session:
-                credentials = await CredentialRepository.available(
-                    session,
-                    CredentialPlatform.TELEGRAM,
-                    limit=self.settings.tg_max_active_accounts,
-                )
-            for index, credential in enumerate(credentials):
-                if credential.id not in tasks:
-                    tasks[credential.id] = asyncio.create_task(
-                        self.account_loop(credential, index + 1)
+                        direct_route_ok = False
+                        logger.exception("telegram_ip_check_failed")
+                    if not direct_route_ok and tasks:
+                        for task in tasks.values():
+                            task.cancel()
+                        await asyncio.gather(*tasks.values(), return_exceptions=True)
+                        tasks.clear()
+                if not direct_route_ok:
+                    await asyncio.sleep(30)
+                    continue
+                for credential_id, task in list(tasks.items()):
+                    if task.done():
+                        try:
+                            task.result()
+                        except Exception:
+                            logger.exception("tg_account_task_failed", credential_id=credential_id)
+                        tasks.pop(credential_id, None)
+                async with SessionFactory() as session:
+                    credentials = await CredentialRepository.available(
+                        session,
+                        CredentialPlatform.TELEGRAM,
+                        limit=self.settings.tg_max_active_accounts,
                     )
-            if not tasks:
-                logger.warning("no_telegram_accounts")
-            await asyncio.sleep(15)
+                for index, credential in enumerate(credentials):
+                    if credential.id not in tasks:
+                        tasks[credential.id] = asyncio.create_task(
+                            self.account_loop(credential, index + 1)
+                        )
+                if not tasks:
+                    logger.warning("no_telegram_accounts")
+                await asyncio.sleep(15)
+        finally:
+            for task in tasks.values():
+                task.cancel()
+            if tasks:
+                await asyncio.gather(*tasks.values(), return_exceptions=True)
+            await self.alert_bot.session.close()

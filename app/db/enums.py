@@ -43,6 +43,7 @@ class CredentialPlatform(StrEnum):
 class CredentialStatus(StrEnum):
     ACTIVE = "active"
     COOLDOWN = "cooldown"
+    LIMITED = "limited"
     DEAD = "dead"
     DISABLED = "disabled"
 

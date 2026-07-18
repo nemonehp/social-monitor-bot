@@ -167,19 +167,40 @@ async def source_receive_link(message: Message, state: FSMContext) -> None:
     )
     await state.set_state(AddSourceState.waiting_region)
     await message.answer(
-        "Введите регион. Федеральный округ бот определит автоматически.",
-        reply_markup=kb([[("Без региона", "source:region:skip")], [("Отмена", "source:add")]]),
+        "Введите подкатегорию. Для региональных источников укажите регион — "
+        "категория (федеральный округ) определится автоматически.\n\n"
+        "Для произвольной структуры используйте: <code>Категория / Подкатегория</code>.",
+        reply_markup=kb([[("Без категории", "source:region:skip")], [("Отмена", "source:add")]]),
     )
 
 
-async def _source_confirm(message: Message, state: FSMContext, region: str) -> None:
-    data = await state.get_data()
-    region = normalize_region(region)
+def _parse_category_input(value: str) -> tuple[str, str]:
+    clean = " ".join((value or "").strip().split())
+    if not clean:
+        return "", ""
+    if "/" in clean:
+        category, subcategory = (part.strip() for part in clean.split("/", 1))
+        return category, subcategory
+    region = normalize_region(clean)
     district = federal_district_for(region)
-    await state.update_data(region=region, federal_district=district)
+    if district:
+        return district, region
+    return "", clean
+
+
+async def _source_confirm(message: Message, state: FSMContext, category_value: str) -> None:
+    data = await state.get_data()
+    category, subcategory = _parse_category_input(category_value)
+    # Legacy location fields are kept in sync for compatibility with existing exports.
+    await state.update_data(
+        category=category,
+        subcategory=subcategory,
+        region=subcategory,
+        federal_district=category,
+    )
     await state.set_state(AddSourceState.confirm)
     platform = "VK" if data["platform"] == "vk" else "Telegram"
-    location = " · ".join(x for x in [region, district] if x) or "Без региона"
+    location = " · ".join(x for x in [category, subcategory] if x) or "Без категории"
     await message.answer(
         f"<b>Добавить источник?</b>\n\n{platform}\n{h(data['normalized_link'])}\n{h(location)}",
         reply_markup=kb([
@@ -214,6 +235,8 @@ async def source_confirm_add(callback: CallbackQuery, state: FSMContext, setting
                 external_id=data.get("identifier", ""),
                 region=data.get("region", ""),
                 federal_district=data.get("federal_district", ""),
+                category=data.get("category", ""),
+                subcategory=data.get("subcategory", ""),
                 added_by=callback.from_user.id,
             )
             await AuditRepository.write(
@@ -355,16 +378,16 @@ def _source_return_callback(code: str) -> str:
 
 
 async def _resolve_district(session, token: str) -> str | None:
-    for district, _count in await SourceRepository.district_counts(session):
-        if _location_token(district) == token:
-            return district
+    for category, _count in await SourceRepository.category_counts(session):
+        if _location_token(category) == token:
+            return category
     return None
 
 
-async def _resolve_region(session, district: str, token: str) -> str | None:
-    for region, _count in await SourceRepository.region_counts(session, district):
-        if _location_token(region) == token:
-            return region
+async def _resolve_region(session, category: str, token: str) -> str | None:
+    for subcategory, _count in await SourceRepository.subcategory_counts(session, category):
+        if _location_token(subcategory) == token:
+            return subcategory
     return None
 
 
@@ -378,8 +401,8 @@ async def _source_list_payload(
     page: int,
     query: str = "",
     platform: Platform | None = None,
-    region: str | None = None,
-    federal_district: str | None = None,
+    category: str | None = None,
+    subcategory: str | None = None,
     alphabetical: bool = True,
     return_code_prefix: str,
     callback_prefix: str,
@@ -392,8 +415,8 @@ async def _source_list_payload(
             page_size=SOURCE_PAGE_SIZE,
             query=query,
             platform=platform,
-            region=region,
-            federal_district=federal_district,
+            category=category,
+            subcategory=subcategory,
             alphabetical=alphabetical,
         )
         pages = max(1, math.ceil(total / SOURCE_PAGE_SIZE))
@@ -405,14 +428,14 @@ async def _source_list_payload(
                 page_size=SOURCE_PAGE_SIZE,
                 query=query,
                 platform=platform,
-                region=region,
-                federal_district=federal_district,
+                category=category,
+                subcategory=subcategory,
                 alphabetical=alphabetical,
             )
     rows: list[list[tuple[str, str]]] = []
     for source in sources:
         code = return_code_prefix.format(page=page)
-        icon = "VK" if source.platform == Platform.VK else "TG"
+        icon = "🟦" if source.platform == Platform.VK else "✈️"
         rows.append([(
             f"{icon} · {_source_button_text(source)}",
             f"source:view:{source.id}:{code}",
@@ -449,7 +472,7 @@ async def source_menu(callback: CallbackQuery, state: FSMContext) -> None:
         f"<b>Источники</b>\n\nVK: {vk_count}\nTelegram: {tg_count}",
         kb([
             [("🔎 Поиск", "source:search")],
-            [("🗺 По ФО и регионам", "source:districts:1")],
+            [("🗂 Категории", "source:districts:1")],
             [(f"VK · алфавит ({vk_count})", "source:alpha:vk:1")],
             [(f"Telegram · алфавит ({tg_count})", "source:alpha:telegram:1")],
             [("Назад", "menu:main")],
@@ -486,13 +509,13 @@ async def source_alpha(callback: CallbackQuery) -> None:
 async def source_districts(callback: CallbackQuery) -> None:
     page = int(callback.data.rsplit(":", 1)[-1])
     async with SessionFactory() as session:
-        districts = await SourceRepository.district_counts(session)
+        districts = await SourceRepository.category_counts(session)
     pages = max(1, math.ceil(len(districts) / SOURCE_PAGE_SIZE))
     page = min(max(1, page), pages)
     chunk = districts[(page - 1) * SOURCE_PAGE_SIZE: page * SOURCE_PAGE_SIZE]
     rows = [[
         (
-            f"{_display_location(district, 'Без округа')} · {count}",
+            f"{_display_location(district, 'Без категории')} · {count}",
             f"source:regions:{_location_token(district)}:1",
         )
     ] for district, count in chunk]
@@ -504,7 +527,7 @@ async def source_districts(callback: CallbackQuery) -> None:
         nav.append(("→", f"source:districts:{page + 1}"))
     rows.append(nav)
     rows.append([("К разделам", "source:menu")])
-    await edit_or_answer(callback, "<b>Федеральные округа</b>", kb(rows))
+    await edit_or_answer(callback, "<b>Категории</b>", kb(rows))
     await callback.answer()
 
 
@@ -517,13 +540,13 @@ async def source_regions(callback: CallbackQuery) -> None:
         if district is None:
             await callback.answer("Список изменился, откройте раздел заново", show_alert=True)
             return
-        regions = await SourceRepository.region_counts(session, district)
+        regions = await SourceRepository.subcategory_counts(session, district)
     pages = max(1, math.ceil(len(regions) / SOURCE_PAGE_SIZE))
     page = min(max(1, page), pages)
     chunk = regions[(page - 1) * SOURCE_PAGE_SIZE: page * SOURCE_PAGE_SIZE]
     rows = [[
         (
-            f"{_display_location(region, 'Без региона')} · {count}",
+            f"{_display_location(region, 'Без подкатегории')} · {count}",
             f"source:regionitems:{district_token}:{_location_token(region)}:1",
         )
     ] for region, count in chunk]
@@ -534,10 +557,10 @@ async def source_regions(callback: CallbackQuery) -> None:
     if page < pages:
         nav.append(("→", f"source:regions:{district_token}:{page + 1}"))
     rows.append(nav)
-    rows.append([("К округам", "source:districts:1")])
+    rows.append([("К категориям", "source:districts:1")])
     await edit_or_answer(
         callback,
-        f"<b>{h(_display_location(district, 'Без округа'))}</b>\n\nВыберите регион.",
+        f"<b>{h(_display_location(district, 'Без категории'))}</b>\n\nВыберите подкатегорию.",
         kb(rows),
     )
     await callback.answer()
@@ -550,28 +573,28 @@ async def source_region_items(callback: CallbackQuery) -> None:
     async with SessionFactory() as session:
         district = await _resolve_district(session, district_token)
         if district is None:
-            await callback.answer("Округ не найден", show_alert=True)
+            await callback.answer("Категория не найдена", show_alert=True)
             return
         region = await _resolve_region(session, district, region_token)
         if region is None:
-            await callback.answer("Регион не найден", show_alert=True)
+            await callback.answer("Подкатегория не найдена", show_alert=True)
             return
     count_text, markup = await _source_list_payload(
         page=page,
-        region=region,
-        federal_district=district,
+        category=district,
+        subcategory=region,
         return_code_prefix=f"r.{district_token}.{region_token}.{{page}}",
         callback_prefix=f"source:regionitems:{district_token}:{region_token}:{{page}}",
     )
     # Replace the generic section button with a region-level back button.
     markup.inline_keyboard[-1] = [InlineKeyboardButton(
-        text="К регионам",
+        text="К подкатегориям",
         callback_data=f"source:regions:{district_token}:1",
     )]
     await edit_or_answer(
         callback,
-        f"<b>{h(_display_location(region, 'Без региона'))}</b>\n"
-        f"{h(_display_location(district, 'Без округа'))}\n\n{count_text}",
+        f"<b>{h(_display_location(region, 'Без подкатегории'))}</b>\n"
+        f"{h(_display_location(district, 'Без категории'))}\n\n{count_text}",
         markup,
     )
     await callback.answer()
@@ -653,7 +676,7 @@ async def source_view(callback: CallbackQuery) -> None:
         SourceStatus.ERROR: "ошибка",
         SourceStatus.DELETED: "удалён",
     }[source.status]
-    location = " · ".join(x for x in [source.region, source.federal_district] if x) or "Без региона"
+    location = " · ".join(x for x in [source.category, source.subcategory] if x) or "Без категории"
     text = (
         f"<b>{h(source.title or source.normalized_link)}</b>\n"
         f"ID: <code>{source.id}</code>\n"
@@ -671,7 +694,7 @@ async def source_view(callback: CallbackQuery) -> None:
     )
     await edit_or_answer(callback, text, kb([
         [toggle],
-        [("Изменить регион", f"source:region:{source.id}")],
+        [("Изменить категорию", f"source:region:{source.id}")],
         [("Удалить", f"source:delete:ask:{source.id}:{return_code}")],
         [("Назад", _source_return_callback(return_code))],
     ]))
@@ -734,28 +757,38 @@ async def source_region_edit(callback: CallbackQuery, state: FSMContext) -> None
     source_id = int(callback.data.rsplit(":", 1)[-1])
     await state.set_state(EditRegionState.waiting_region)
     await state.update_data(source_id=source_id)
-    await edit_or_answer(callback, "Введите новый регион.", kb([[("Отмена", f"source:view:{source_id}:m")]]))
+    await edit_or_answer(
+        callback,
+        "Введите <code>Категория / Подкатегория</code>. Для региона можно отправить только его название.",
+        kb([[("Отмена", f"source:view:{source_id}:m")]]),
+    )
     await callback.answer()
 
 
 @router.message(EditRegionState.waiting_region, F.text)
 async def source_region_save(message: Message, state: FSMContext) -> None:
     data = await state.get_data()
-    region = normalize_region(message.text or "")
-    district = federal_district_for(region)
+    category, subcategory = _parse_category_input(message.text or "")
     async with SessionFactory() as session:
         async with session.begin():
-            await SourceRepository.update_region(session, int(data["source_id"]), region, district)
+            await SourceRepository.update_category(
+                session,
+                int(data["source_id"]),
+                category,
+                subcategory,
+                sync_location=True,
+            )
             await AuditRepository.write(
                 session,
                 message.from_user.id,
-                "source_region_changed",
+                "source_category_changed",
                 "source",
                 str(data["source_id"]),
-                {"region": region, "district": district},
+                {"category": category, "subcategory": subcategory},
             )
     await state.clear()
-    await message.answer(f"✅ Регион обновлён: {h(region)} · {h(district or 'округ не определён')}")
+    location = " · ".join(value for value in [category, subcategory] if value) or "Без категории"
+    await message.answer(f"✅ Категория обновлена: {h(location)}")
 
 
 @router.callback_query(F.data == "noop")
@@ -1070,8 +1103,15 @@ async def admin_status(callback: CallbackQuery) -> None:
         f"VK: {job_line('vk')}\n"
         f"Telegram: {job_line('telegram')}\n"
         f"Очередь доставок: {pending_deliveries}\n\n"
-        f"Прокси: {h(proxy_counts)}\n"
-        f"Аккаунты: {h(account_counts)}"
+        f"Прокси: рабочие {proxy_counts.get('healthy', 0) + proxy_counts.get('degraded', 0)} · "
+        f"холд {proxy_counts.get('quarantine', 0)} · удалено {proxy_counts.get('removed', 0)}\n"
+        f"VK-аккаунты: active {account_counts.get('vk:active', 0)} · "
+        f"cooldown {account_counts.get('vk:cooldown', 0)} · "
+        f"limited {account_counts.get('vk:limited', 0)} · dead {account_counts.get('vk:dead', 0)}\n"
+        f"Telegram-аккаунты: active {account_counts.get('telegram:active', 0)} · "
+        f"cooldown {account_counts.get('telegram:cooldown', 0)} · "
+        f"limited {account_counts.get('telegram:limited', 0)} · "
+        f"dead {account_counts.get('telegram:dead', 0)}"
     )
     await edit_or_answer(callback, text, admin_menu())
     await callback.answer()

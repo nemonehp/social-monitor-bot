@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import csv
 import io
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 
 from openpyxl import load_workbook
 
@@ -20,6 +21,8 @@ class SourceCandidate:
     normalized_link: str
     region: str
     federal_district: str
+    category: str
+    subcategory: str
     title: str = ""
     external_id: str = ""
     row_number: int = 0
@@ -42,6 +45,8 @@ class ImportPreview:
 HEADER_ALIASES = {
     "region": {"регион", "субъект", "область", "region"},
     "district": {"федеральный округ", "фо", "округ", "federal district"},
+    "category": {"категория", "category"},
+    "subcategory": {"подкатегория", "subcategory"},
     "link": {"ссылка", "url", "link", "ссылка на аккаунт", "ссылка на группу"},
     "tg_link": {"ссылка на тг-канал ро", "telegram", "ссылка telegram", "ссылка тг", "tg link"},
     "vk_link": {"ссылка на группу вк ро", "вконтакте", "ссылка вк", "vk link"},
@@ -96,8 +101,16 @@ def _parse_rows(rows: Iterable[list[Any]]) -> ImportPreview:
 
     for row_number, row in enumerate(rows, start=2):
         input_rows += 1
-        region = normalize_region(_value(row, mapping, "region"))
-        district = _value(row, mapping, "district") or federal_district_for(region)
+        raw_region = _value(row, mapping, "region")
+        region = normalize_region(raw_region)
+        explicit_subcategory = _value(row, mapping, "subcategory")
+        subcategory = explicit_subcategory or region
+        category = (
+            _value(row, mapping, "category")
+            or _value(row, mapping, "district")
+            or federal_district_for(region)
+        )
+        district = category if region else _value(row, mapping, "district")
 
         entries: list[tuple[str, str, str, str]] = []
         generic = _value(row, mapping, "link")
@@ -135,6 +148,8 @@ def _parse_rows(rows: Iterable[list[Any]]) -> ImportPreview:
                         normalized_link=normalized.normalized_link,
                         region=region,
                         federal_district=district,
+                        category=category,
+                        subcategory=subcategory,
                         title=title,
                         external_id=external_id,
                         row_number=row_number,
@@ -150,7 +165,7 @@ def parse_xlsx(path: Path) -> ImportPreview:
     workbook = load_workbook(path, read_only=True, data_only=True)
     sheet = workbook.active
     try:
-        return _parse_rows((list(row) for row in sheet.iter_rows(values_only=True)))
+        return _parse_rows(list(row) for row in sheet.iter_rows(values_only=True))
     finally:
         workbook.close()
 
@@ -165,7 +180,7 @@ def parse_delimited(path: Path) -> ImportPreview:
         dialect = csv.excel
         dialect.delimiter = ";"
     reader = csv.reader(io.StringIO(text), dialect)
-    return _parse_rows((list(row) for row in reader))
+    return _parse_rows(list(row) for row in reader)
 
 
 def parse_text(path: Path) -> ImportPreview:
@@ -190,6 +205,8 @@ def parse_text(path: Path) -> ImportPreview:
                     normalized_link=normalized.normalized_link,
                     region="",
                     federal_district="",
+                    category="",
+                    subcategory="",
                     row_number=row_number,
                 )
             )

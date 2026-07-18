@@ -135,11 +135,15 @@ class SourceRepository:
         region: str,
         federal_district: str,
         added_by: int,
+        category: str | None = None,
+        subcategory: str | None = None,
         title: str = "",
         external_id: str = "",
         metadata: dict[str, Any] | None = None,
         next_check_at: datetime | None = None,
     ) -> tuple[Source, bool]:
+        category = federal_district if category is None else category
+        subcategory = region if subcategory is None else subcategory
         existing = await session.scalar(
             select(Source).where(
                 Source.platform == platform,
@@ -153,6 +157,10 @@ class SourceRepository:
                 existing.region = region
             if federal_district:
                 existing.federal_district = federal_district
+            if category:
+                existing.category = category
+            if subcategory:
+                existing.subcategory = subcategory
             if title and not existing.title:
                 existing.title = title
             return existing, False
@@ -164,6 +172,8 @@ class SourceRepository:
             normalized_link=normalized_link,
             region=region,
             federal_district=federal_district,
+            category=category,
+            subcategory=subcategory,
             added_by=added_by,
             title=title,
             external_id=external_id,
@@ -188,26 +198,32 @@ class SourceRepository:
         for start in range(0, len(rows), 5000):
             chunk = rows[start : start + 5000]
             keys = [(Platform(row["platform"]), row["normalized_link"]) for row in chunk]
-            existing = await session.scalars(
+            existing_rows = await session.scalars(
                 select(Source).where(tuple_(Source.platform, Source.normalized_link).in_(keys))
             )
-            existing_map.update({(row.platform, row.normalized_link): row for row in existing})
+            existing_map.update({(row.platform, row.normalized_link): row for row in existing_rows})
         created = updated = 0
         for row in rows:
             platform = Platform(row["platform"])
             key = (platform, row["normalized_link"])
-            existing = existing_map.get(key)
-            if existing:
-                if existing.status == SourceStatus.DELETED:
-                    existing.status = SourceStatus.ACTIVE
+            existing_source = existing_map.get(key)
+            if existing_source:
+                if existing_source.status == SourceStatus.DELETED:
+                    existing_source.status = SourceStatus.ACTIVE
                 if row.get("region"):
-                    existing.region = row["region"]
+                    existing_source.region = row["region"]
                 if row.get("federal_district"):
-                    existing.federal_district = row["federal_district"]
+                    existing_source.federal_district = row["federal_district"]
+                category = row.get("category") or row.get("federal_district") or ""
+                subcategory = row.get("subcategory") or row.get("region") or ""
+                if category:
+                    existing_source.category = category
+                if subcategory:
+                    existing_source.subcategory = subcategory
                 if row.get("title"):
-                    existing.title = row["title"][:500]
+                    existing_source.title = row["title"][:500]
                 if row.get("external_id"):
-                    existing.external_id = str(row["external_id"])[:255]
+                    existing_source.external_id = str(row["external_id"])[:255]
                 updated += 1
                 continue
             started_at = utcnow()
@@ -217,6 +233,8 @@ class SourceRepository:
                 normalized_link=row["normalized_link"],
                 region=row.get("region", ""),
                 federal_district=row.get("federal_district", ""),
+                category=row.get("category") or row.get("federal_district", ""),
+                subcategory=row.get("subcategory") or row.get("region", ""),
                 added_by=added_by,
                 title=row.get("title", ""),
                 external_id=str(row.get("external_id", "")),
@@ -249,6 +267,8 @@ class SourceRepository:
         status: SourceStatus | None = None,
         region: str | None = None,
         federal_district: str | None = None,
+        category: str | None = None,
+        subcategory: str | None = None,
         alphabetical: bool = False,
     ) -> tuple[list[Source], int]:
         filters = [Source.status != SourceStatus.DELETED]
@@ -261,6 +281,8 @@ class SourceRepository:
                     Source.normalized_link.ilike(token),
                     Source.external_id.ilike(token),
                     Source.region.ilike(token),
+                    Source.category.ilike(token),
+                    Source.subcategory.ilike(token),
                     cast(Source.id, String).ilike(token),
                 )
             )
@@ -272,6 +294,10 @@ class SourceRepository:
             filters.append(Source.region == region)
         if federal_district is not None:
             filters.append(Source.federal_district == federal_district)
+        if category is not None:
+            filters.append(Source.category == category)
+        if subcategory is not None:
+            filters.append(Source.subcategory == subcategory)
         total = int(await session.scalar(select(func.count()).select_from(Source).where(*filters)) or 0)
         alphabetical_key = func.lower(
             func.coalesce(func.nullif(Source.title, ""), Source.normalized_link)
@@ -290,7 +316,7 @@ class SourceRepository:
         elif alphabetical:
             order_by = (alphabetical_key, Source.id)
         else:
-            order_by = (Source.region, Source.title, Source.id)
+            order_by = (Source.category, Source.subcategory, Source.title, Source.id)
         rows = await session.scalars(
             select(Source)
             .where(*filters)
@@ -299,6 +325,32 @@ class SourceRepository:
             .limit(page_size)
         )
         return list(rows), total
+
+    @staticmethod
+    async def category_counts(session: AsyncSession) -> builtins.list[tuple[str, int]]:
+        rows = await session.execute(
+            select(Source.category, func.count())
+            .where(Source.status != SourceStatus.DELETED)
+            .group_by(Source.category)
+            .order_by(func.lower(Source.category))
+        )
+        return [(category or "", int(count)) for category, count in rows]
+
+    @staticmethod
+    async def subcategory_counts(
+        session: AsyncSession,
+        category: str,
+    ) -> builtins.list[tuple[str, int]]:
+        rows = await session.execute(
+            select(Source.subcategory, func.count())
+            .where(
+                Source.status != SourceStatus.DELETED,
+                Source.category == category,
+            )
+            .group_by(Source.subcategory)
+            .order_by(func.lower(Source.subcategory))
+        )
+        return [(subcategory or "", int(count)) for subcategory, count in rows]
 
     @staticmethod
     async def district_counts(session: AsyncSession) -> builtins.list[tuple[str, int]]:
@@ -337,8 +389,27 @@ class SourceRepository:
         await session.execute(
             update(Source)
             .where(Source.id == source_id)
-            .values(region=region, federal_district=federal_district)
+            .values(
+                region=region,
+                federal_district=federal_district,
+                category=federal_district,
+                subcategory=region,
+            )
         )
+
+    @staticmethod
+    async def update_category(
+        session: AsyncSession,
+        source_id: int,
+        category: str,
+        subcategory: str,
+        *,
+        sync_location: bool = False,
+    ) -> None:
+        values: dict[str, Any] = {"category": category, "subcategory": subcategory}
+        if sync_location:
+            values.update(federal_district=category, region=subcategory)
+        await session.execute(update(Source).where(Source.id == source_id).values(**values))
 
     @staticmethod
     async def update_after_success(
@@ -544,7 +615,11 @@ class ItemRepository:
     ) -> tuple[int, int]:
         inserted = 0
         deliveries = 0
-        for payload in items:
+        ordered_items = sorted(
+            items,
+            key=lambda payload: (payload.published_at or utcnow(), payload.item_key),
+        )
+        for payload in ordered_items:
             stmt = (
                 insert(Item)
                 .values(
@@ -644,29 +719,84 @@ class DeliveryRepository:
         return int(result.rowcount or 0)
 
     @staticmethod
+    def _load_options():
+        return (
+            selectinload(Delivery.item).selectinload(Item.source),
+            selectinload(Delivery.item).selectinload(Item.media),
+        )
+
+    @staticmethod
     async def claim(session: AsyncSession, lease_seconds: int) -> Delivery | None:
+        batch = await DeliveryRepository.claim_batch(session, lease_seconds=lease_seconds, batch_size=1)
+        return batch[0] if batch else None
+
+    @staticmethod
+    async def claim_batch(
+        session: AsyncSession,
+        *,
+        lease_seconds: int,
+        batch_size: int,
+    ) -> list[Delivery]:
+        """Claim one source batch and keep its publications in source chronology.
+
+        The source whose oldest due publication is earliest wins the next batch.
+        All currently due publications from that source/chat are then claimed and
+        delivered sequentially, preventing interleaving between communities.
+        """
         now = utcnow()
-        delivery = await session.scalar(
+        first = await session.scalar(
             select(Delivery)
+            .join(Delivery.item)
             .where(
                 Delivery.status.in_([DeliveryStatus.PENDING, DeliveryStatus.RETRY]),
                 Delivery.run_after <= now,
             )
-            .order_by(Delivery.run_after, Delivery.id)
+            .order_by(Item.published_at.asc().nulls_last(), Item.id, Delivery.id)
             .with_for_update(skip_locked=True)
-            .options(
-                selectinload(Delivery.item).selectinload(Item.source),
-                selectinload(Delivery.item).selectinload(Item.media),
-            )
+            .options(*DeliveryRepository._load_options())
             .limit(1)
         )
-        if not delivery:
-            return None
-        delivery.status = DeliveryStatus.RUNNING
-        delivery.locked_until = now + timedelta(seconds=lease_seconds)
-        delivery.attempts += 1
+        if not first:
+            return []
+        source_id = first.item.source_id
+        target_chat_id = first.target_chat_id
+        batch_query = (
+            select(Delivery)
+            .join(Delivery.item)
+            .where(
+                Delivery.status.in_([DeliveryStatus.PENDING, DeliveryStatus.RETRY]),
+                Delivery.run_after <= now,
+                Delivery.target_chat_id == target_chat_id,
+                Item.source_id == source_id,
+            )
+            .order_by(Item.published_at.asc().nulls_last(), Item.id, Delivery.id)
+            .with_for_update(skip_locked=True)
+            .options(*DeliveryRepository._load_options())
+        )
+        if batch_size > 0:
+            batch_query = batch_query.limit(batch_size)
+        rows = list(await session.scalars(batch_query))
+        locked_until = now + timedelta(seconds=lease_seconds)
+        for delivery in rows:
+            delivery.status = DeliveryStatus.RUNNING
+            delivery.locked_until = locked_until
+            delivery.attempts += 1
         await session.flush()
-        return delivery
+        return rows
+
+    @staticmethod
+    async def release(session: AsyncSession, delivery_ids: list[int], delay_seconds: int = 0) -> None:
+        if not delivery_ids:
+            return
+        await session.execute(
+            update(Delivery)
+            .where(Delivery.id.in_(delivery_ids), Delivery.status == DeliveryStatus.RUNNING)
+            .values(
+                status=DeliveryStatus.PENDING,
+                run_after=utcnow() + timedelta(seconds=max(0, delay_seconds)),
+                locked_until=None,
+            )
+        )
 
     @staticmethod
     async def sent(session: AsyncSession, delivery_id: int, message_ids: list[int]) -> None:
@@ -718,6 +848,10 @@ class CredentialRepository:
             existing.config_json = config
             existing.status = CredentialStatus.ACTIVE
             existing.cooldown_until = None
+            existing.last_error = ""
+            existing.health_failures = 0
+            existing.dead_since = None
+            existing.dead_notified_at = None
             return existing, False
         row = Credential(
             platform=platform,
@@ -742,7 +876,7 @@ class CredentialRepository:
                 or_(
                     Credential.status == CredentialStatus.ACTIVE,
                     and_(
-                        Credential.status == CredentialStatus.COOLDOWN,
+                        Credential.status.in_([CredentialStatus.COOLDOWN, CredentialStatus.LIMITED]),
                         Credential.cooldown_until <= now,
                     ),
                 ),
@@ -753,38 +887,87 @@ class CredentialRepository:
         return list(rows)
 
     @staticmethod
-    async def mark_success(session: AsyncSession, credential_id: int) -> None:
+    async def mark_success(
+        session: AsyncSession,
+        credential_id: int,
+        *,
+        health_verified: bool = True,
+    ) -> None:
+        now = utcnow()
+        values: dict[str, Any] = {
+            "status": CredentialStatus.ACTIVE,
+            "cooldown_until": None,
+            "last_success_at": now,
+            "last_error": "",
+            "requests_count": Credential.requests_count + 1,
+            "last_health_check_at": now,
+            "dead_since": None,
+            "dead_notified_at": None,
+        }
+        if health_verified:
+            values.update(last_health_ok_at=now, health_failures=0)
+        else:
+            values["health_failures"] = Credential.health_failures + 1
+        await session.execute(update(Credential).where(Credential.id == credential_id).values(**values))
+
+    @staticmethod
+    async def mark_dead(session: AsyncSession, credential_id: int, error: str) -> bool:
+        row = await session.scalar(
+            select(Credential).where(Credential.id == credential_id).with_for_update()
+        )
+        if not row:
+            return False
+        transitioned = row.status != CredentialStatus.DEAD
+        row.status = CredentialStatus.DEAD
+        row.cooldown_until = None
+        row.last_error = error[:4000]
+        row.last_health_check_at = utcnow()
+        row.health_failures += 1
+        if transitioned:
+            row.dead_since = utcnow()
+            row.dead_notified_at = None
+        return transitioned
+
+    @staticmethod
+    async def mark_dead_notified(session: AsyncSession, credential_id: int) -> None:
         await session.execute(
             update(Credential)
-            .where(Credential.id == credential_id)
-            .values(
-                status=CredentialStatus.ACTIVE,
-                cooldown_until=None,
-                last_success_at=utcnow(),
-                last_error="",
-                requests_count=Credential.requests_count + 1,
+            .where(Credential.id == credential_id, Credential.status == CredentialStatus.DEAD)
+            .values(dead_notified_at=utcnow())
+        )
+
+    @staticmethod
+    async def unreported_dead(session: AsyncSession, limit: int = 100) -> list[Credential]:
+        return list(
+            await session.scalars(
+                select(Credential)
+                .where(
+                    Credential.status == CredentialStatus.DEAD,
+                    Credential.dead_notified_at.is_(None),
+                )
+                .order_by(Credential.dead_since.nullsfirst(), Credential.id)
+                .limit(limit)
             )
         )
 
     @staticmethod
-    async def mark_dead(session: AsyncSession, credential_id: int, error: str) -> None:
-        await session.execute(
-            update(Credential)
-            .where(Credential.id == credential_id)
-            .values(status=CredentialStatus.DEAD, last_error=error[:4000])
-        )
-
-    @staticmethod
     async def cooldown(
-        session: AsyncSession, credential_id: int, seconds: int, error: str
+        session: AsyncSession,
+        credential_id: int,
+        seconds: int,
+        error: str,
+        *,
+        limited: bool = False,
     ) -> None:
         await session.execute(
             update(Credential)
             .where(Credential.id == credential_id)
             .values(
-                status=CredentialStatus.COOLDOWN,
+                status=CredentialStatus.LIMITED if limited else CredentialStatus.COOLDOWN,
                 cooldown_until=utcnow() + timedelta(seconds=max(1, seconds)),
                 last_error=error[:4000],
+                last_health_check_at=utcnow(),
+                health_failures=Credential.health_failures + 1,
             )
         )
 
@@ -824,6 +1007,7 @@ class ProxyRepository:
             existing.failures = 0
             existing.last_error = ""
             existing.last_check_at = utcnow()
+            existing.last_success_at = utcnow()
             return existing, False
         row = Proxy(
             canonical_url_hash=url_hash,
@@ -836,6 +1020,7 @@ class ProxyRepository:
             status=ProxyStatus.HEALTHY,
             successes=1,
             last_check_at=utcnow(),
+            last_success_at=utcnow(),
         )
         session.add(row)
         await session.flush()
@@ -865,6 +1050,7 @@ class ProxyRepository:
             "successes": Proxy.successes + 1,
             "last_error": "",
             "last_check_at": utcnow(),
+            "last_success_at": utcnow(),
             "quarantine_until": None,
         }
         if latency_ms is not None:
@@ -880,20 +1066,27 @@ class ProxyRepository:
         quarantine_after: int,
         remove_after: int,
         quarantine_minutes: int,
+        remove_after_hours: int = 3,
         immediate_remove: bool = False,
     ) -> ProxyStatus:
         row = await session.get(Proxy, proxy_id)
         if not row:
             return ProxyStatus.REMOVED
+        now = utcnow()
         row.failures += 1
         row.last_error = error[:4000]
-        row.last_check_at = utcnow()
-        if immediate_remove or row.failures >= remove_after:
+        row.last_check_at = now
+        last_known_good = row.last_success_at or (row.created_at if row.successes == 0 else None)
+        failed_too_long = bool(
+            last_known_good
+            and last_known_good <= now - timedelta(hours=max(1, remove_after_hours))
+        )
+        if immediate_remove or failed_too_long:
             row.status = ProxyStatus.REMOVED
             row.quarantine_until = None
-        elif row.failures >= quarantine_after:
+        elif row.failures >= max(1, quarantine_after):
             row.status = ProxyStatus.QUARANTINE
-            row.quarantine_until = utcnow() + timedelta(minutes=quarantine_minutes)
+            row.quarantine_until = now + timedelta(minutes=quarantine_minutes)
         else:
             row.status = ProxyStatus.DEGRADED
         return row.status
@@ -913,6 +1106,8 @@ class AlertRepository:
         active: bool,
         payload: dict[str, Any],
         cooldown_minutes: int,
+        repeat_while_active: bool = False,
+        send_recovery: bool = False,
     ) -> bool:
         row = await session.get(AlertState, alert_key)
         now = utcnow()
@@ -925,7 +1120,11 @@ class AlertRepository:
         cooldown_passed = not row.last_sent_at or row.last_sent_at <= now - timedelta(minutes=cooldown_minutes)
         row.active = active
         row.payload = payload
-        if changed or (active and cooldown_passed):
+        if active and changed:
+            return True
+        if active and repeat_while_active and cooldown_passed:
+            return True
+        if not active and changed and send_recovery:
             return True
         return False
 

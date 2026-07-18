@@ -27,8 +27,8 @@ from app.db.models import Source
 from app.services.network import proxy_session
 from app.utils.text import clean_text
 
-TOKEN_DEAD_CODES = {5, 14, 17, 27, 28}
-RETRY_CODES = {6, 9, 10, 29}
+TOKEN_DEAD_CODES = {5, 17, 27, 28}
+RETRY_CODES = {6, 9, 10, 14, 29}
 ACCESS_CODES = {15, 200, 201, 203}
 METHOD_UNAVAILABLE_CODES = {3, 7}
 NOT_FOUND_CODES = {18, 30, 100, 113}
@@ -93,7 +93,8 @@ class VkCollector:
             if error.code in TOKEN_DEAD_CODES:
                 raise CredentialDeadError(str(error)) from error
             if error.code in RETRY_CODES:
-                raise RateLimitedError(str(error), retry_after=2) from error
+                retry_after = 900 if error.code == 14 else 2
+                raise RateLimitedError(str(error), retry_after=retry_after) from error
             if error.code in METHOD_UNAVAILABLE_CODES:
                 raise FeatureUnavailableError(str(error)) from error
             if error.code in ACCESS_CODES:
@@ -356,26 +357,53 @@ class VkCollector:
             )
             normalized_link = f"https://vk.com/{screen_name}" if screen_name else source.normalized_link
 
+            # Content-level credential probe. This is deliberately stronger than
+            # a profile/auth call: the token must be able to read an actual wall.
+            probe_data = await self._call(
+                session,
+                request_proxy,
+                token,
+                "wall.get",
+                {
+                    "owner_id": owner_id,
+                    "count": max(self.settings.vk_page_size, getattr(self.settings, "credential_health_probe_posts", 5)),
+                    "offset": 0,
+                    "filter": "owner",
+                },
+            )
+            probe_page = list((probe_data.get("response") or {}).get("items") or [])
+            probe_posts = [post for post in probe_page if int(post.get("id") or 0)]
+            content_probe_ok = bool(probe_posts)
+            known_probe_match = any(
+                f"vk:post:{int(post.get('owner_id') or owner_id)}:{int(post.get('id') or 0)}" in known_recent
+                for post in probe_posts
+            )
+            prefetched_page = probe_page if offset == 0 else None
+
             items: list[CollectedItem] = []
             selected_posts: dict[str, dict[str, Any]] = {}
             found_barrier = False
             pages = 0
 
             while pages < self.settings.vk_max_pages_per_run:
-                data = await self._call(
-                    session,
-                    request_proxy,
-                    token,
-                    "wall.get",
-                    {
-                        "owner_id": owner_id,
-                        "count": self.settings.vk_page_size,
-                        "offset": offset,
-                        "filter": "owner",
-                    },
-                )
-                response = data.get("response") or {}
-                page = response.get("items") or []
+                if prefetched_page is not None:
+                    page = prefetched_page
+                    prefetched_page = None
+                else:
+                    data = await self._call(
+                        session,
+                        request_proxy,
+                        token,
+                        "wall.get",
+                        {
+                            "owner_id": owner_id,
+                            "count": self.settings.vk_page_size,
+                            "offset": offset,
+                            "filter": "owner",
+                        },
+                    )
+                    response = data.get("response") or {}
+                    page = response.get("items") or []
                 if not page:
                     found_barrier = True
                     break
@@ -571,6 +599,9 @@ class VkCollector:
                 "post_keys": new_post_keys[-20:],
                 "story_keys": story_keys[-20:],
                 "story_needs_retry": story_needs_retry,
+                "credential_content_probe_ok": content_probe_ok,
+                "credential_known_post_match": known_probe_match,
+                "credential_probe_ids": [int(post.get("id") or 0) for post in probe_posts[:10]],
             },
         )
 
