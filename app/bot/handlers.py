@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+import hashlib
 import io
 import math
 import secrets
 import tempfile
-from datetime import datetime, timedelta, timezone
 from dataclasses import asdict
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import orjson
@@ -105,11 +106,11 @@ async def start(message: Message, state: FSMContext, settings: Settings) -> None
             return
         token = payload.removeprefix("bind_")
         async with SessionFactory() as session:
-            expected = await SettingsRepository.get(session, "signal_bind_token", "")
-            if not expected or token != expected:
-                await message.answer("Ссылка подключения устарела. Создайте новую в управлении.")
-                return
             async with session.begin():
+                expected = await SettingsRepository.get(session, "signal_bind_token", "")
+                if not expected or token != expected:
+                    await message.answer("Ссылка подключения устарела. Создайте новую в управлении.")
+                    return
                 await SettingsRepository.set(session, "signal_chat_id", message.chat.id)
                 await SettingsRepository.set(session, "signal_bind_token", "")
                 await AuditRepository.write(
@@ -296,7 +297,7 @@ async def source_file_confirm(callback: CallbackQuery, state: FSMContext, settin
             interval = int(await SettingsRepository.get(session, "poll_interval_seconds", settings.default_poll_interval_seconds))
             candidates = payload["candidates"]
             bulk_rows = []
-            now = datetime.now(timezone.utc)
+            now = datetime.now(UTC)
             for index, row in enumerate(candidates):
                 stagger = int(index * interval / max(1, len(candidates)))
                 bulk_rows.append({
@@ -330,38 +331,249 @@ async def source_file_confirm(callback: CallbackQuery, state: FSMContext, settin
     await callback.answer()
 
 
-async def render_source_list(callback: CallbackQuery, page: int = 1, query: str = "") -> None:
+SOURCE_PAGE_SIZE = 8
+
+
+def _location_token(value: str) -> str:
+    return hashlib.sha1(value.encode("utf-8")).hexdigest()[:10]
+
+
+def _display_location(value: str, empty: str) -> str:
+    return value or empty
+
+
+def _source_return_callback(code: str) -> str:
+    parts = code.split(".")
+    if len(parts) == 2 and parts[0] in {"av", "at"}:
+        platform = "vk" if parts[0] == "av" else "telegram"
+        return f"source:alpha:{platform}:{parts[1]}"
+    if len(parts) == 4 and parts[0] == "r":
+        return f"source:regionitems:{parts[1]}:{parts[2]}:{parts[3]}"
+    if len(parts) == 2 and parts[0] == "s":
+        return f"source:search:page:{parts[1]}"
+    return "source:menu"
+
+
+async def _resolve_district(session, token: str) -> str | None:
+    for district, _count in await SourceRepository.district_counts(session):
+        if _location_token(district) == token:
+            return district
+    return None
+
+
+async def _resolve_region(session, district: str, token: str) -> str | None:
+    for region, _count in await SourceRepository.region_counts(session, district):
+        if _location_token(region) == token:
+            return region
+    return None
+
+
+def _source_button_text(source: Source) -> str:
+    title = source.title or source.normalized_link.rstrip("/").split("/")[-1]
+    return title[:42]
+
+
+async def _source_list_payload(
+    *,
+    page: int,
+    query: str = "",
+    platform: Platform | None = None,
+    region: str | None = None,
+    federal_district: str | None = None,
+    alphabetical: bool = True,
+    return_code_prefix: str,
+    callback_prefix: str,
+) -> tuple[str, InlineKeyboardMarkup]:
+    requested_page = max(1, page)
     async with SessionFactory() as session:
-        sources, total = await SourceRepository.list(session, page=page, query=query)
-    pages = max(1, math.ceil(total / 8))
+        sources, total = await SourceRepository.list(
+            session,
+            page=requested_page,
+            page_size=SOURCE_PAGE_SIZE,
+            query=query,
+            platform=platform,
+            region=region,
+            federal_district=federal_district,
+            alphabetical=alphabetical,
+        )
+        pages = max(1, math.ceil(total / SOURCE_PAGE_SIZE))
+        page = min(requested_page, pages)
+        if page != requested_page:
+            sources, _total = await SourceRepository.list(
+                session,
+                page=page,
+                page_size=SOURCE_PAGE_SIZE,
+                query=query,
+                platform=platform,
+                region=region,
+                federal_district=federal_district,
+                alphabetical=alphabetical,
+            )
     rows: list[list[tuple[str, str]]] = []
     for source in sources:
+        code = return_code_prefix.format(page=page)
         icon = "VK" if source.platform == Platform.VK else "TG"
-        title = source.title or source.normalized_link.rstrip("/").split("/")[-1]
-        rows.append([(f"{icon} · {title[:35]}", f"source:view:{source.id}:{page}")])
+        rows.append([(
+            f"{icon} · {_source_button_text(source)}",
+            f"source:view:{source.id}:{code}",
+        )])
     nav: list[tuple[str, str]] = []
     if page > 1:
-        nav.append(("←", f"source:list:{page-1}"))
+        nav.append(("←", callback_prefix.format(page=page - 1)))
     nav.append((f"{page}/{pages}", "noop"))
     if page < pages:
-        nav.append(("→", f"source:list:{page+1}"))
-    if nav:
-        rows.append(nav)
-    rows.extend([
-        [("Поиск", "source:search")],
-        [("Назад", "menu:main")],
-    ])
+        nav.append(("→", callback_prefix.format(page=page + 1)))
+    rows.append(nav)
+    rows.append([("К разделам", "source:menu")])
+    return f"Найдено: {total}", kb(rows)
+
+
+@router.callback_query(F.data == "source:menu")
+async def source_menu(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.set_state(None)
+    async with SessionFactory() as session:
+        vk_count = int(await session.scalar(
+            select(func.count()).select_from(Source).where(
+                Source.status != SourceStatus.DELETED,
+                Source.platform == Platform.VK,
+            )
+        ) or 0)
+        tg_count = int(await session.scalar(
+            select(func.count()).select_from(Source).where(
+                Source.status != SourceStatus.DELETED,
+                Source.platform == Platform.TELEGRAM,
+            )
+        ) or 0)
     await edit_or_answer(
         callback,
-        f"<b>Источники</b>\n\nВсего: {total}",
-        kb(rows),
+        f"<b>Источники</b>\n\nVK: {vk_count}\nTelegram: {tg_count}",
+        kb([
+            [("🔎 Поиск", "source:search")],
+            [("🗺 По ФО и регионам", "source:districts:1")],
+            [(f"VK · алфавит ({vk_count})", "source:alpha:vk:1")],
+            [(f"Telegram · алфавит ({tg_count})", "source:alpha:telegram:1")],
+            [("Назад", "menu:main")],
+        ]),
     )
+    await callback.answer()
 
 
 @router.callback_query(F.data.startswith("source:list:"))
-async def source_list(callback: CallbackQuery) -> None:
+async def source_list_legacy(callback: CallbackQuery, state: FSMContext) -> None:
+    """Keep buttons from messages sent by version 1.0 usable after upgrade."""
+    callback.data = "source:menu"
+    await source_menu(callback, state)
+
+
+@router.callback_query(F.data.startswith("source:alpha:"))
+async def source_alpha(callback: CallbackQuery) -> None:
+    _, _, platform_value, page_value = callback.data.split(":")
+    platform = Platform(platform_value)
+    page = int(page_value)
+    short = "av" if platform == Platform.VK else "at"
+    count_text, markup = await _source_list_payload(
+        page=page,
+        platform=platform,
+        return_code_prefix=f"{short}.{{page}}",
+        callback_prefix=f"source:alpha:{platform.value}:{{page}}",
+    )
+    name = "VK" if platform == Platform.VK else "Telegram"
+    await edit_or_answer(callback, f"<b>{name} · по алфавиту</b>\n\n{count_text}", markup)
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("source:districts:"))
+async def source_districts(callback: CallbackQuery) -> None:
     page = int(callback.data.rsplit(":", 1)[-1])
-    await render_source_list(callback, page)
+    async with SessionFactory() as session:
+        districts = await SourceRepository.district_counts(session)
+    pages = max(1, math.ceil(len(districts) / SOURCE_PAGE_SIZE))
+    page = min(max(1, page), pages)
+    chunk = districts[(page - 1) * SOURCE_PAGE_SIZE: page * SOURCE_PAGE_SIZE]
+    rows = [[
+        (
+            f"{_display_location(district, 'Без округа')} · {count}",
+            f"source:regions:{_location_token(district)}:1",
+        )
+    ] for district, count in chunk]
+    nav = []
+    if page > 1:
+        nav.append(("←", f"source:districts:{page - 1}"))
+    nav.append((f"{page}/{pages}", "noop"))
+    if page < pages:
+        nav.append(("→", f"source:districts:{page + 1}"))
+    rows.append(nav)
+    rows.append([("К разделам", "source:menu")])
+    await edit_or_answer(callback, "<b>Федеральные округа</b>", kb(rows))
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("source:regions:"))
+async def source_regions(callback: CallbackQuery) -> None:
+    _, _, district_token, page_value = callback.data.split(":")
+    page = int(page_value)
+    async with SessionFactory() as session:
+        district = await _resolve_district(session, district_token)
+        if district is None:
+            await callback.answer("Список изменился, откройте раздел заново", show_alert=True)
+            return
+        regions = await SourceRepository.region_counts(session, district)
+    pages = max(1, math.ceil(len(regions) / SOURCE_PAGE_SIZE))
+    page = min(max(1, page), pages)
+    chunk = regions[(page - 1) * SOURCE_PAGE_SIZE: page * SOURCE_PAGE_SIZE]
+    rows = [[
+        (
+            f"{_display_location(region, 'Без региона')} · {count}",
+            f"source:regionitems:{district_token}:{_location_token(region)}:1",
+        )
+    ] for region, count in chunk]
+    nav = []
+    if page > 1:
+        nav.append(("←", f"source:regions:{district_token}:{page - 1}"))
+    nav.append((f"{page}/{pages}", "noop"))
+    if page < pages:
+        nav.append(("→", f"source:regions:{district_token}:{page + 1}"))
+    rows.append(nav)
+    rows.append([("К округам", "source:districts:1")])
+    await edit_or_answer(
+        callback,
+        f"<b>{h(_display_location(district, 'Без округа'))}</b>\n\nВыберите регион.",
+        kb(rows),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("source:regionitems:"))
+async def source_region_items(callback: CallbackQuery) -> None:
+    _, _, district_token, region_token, page_value = callback.data.split(":")
+    page = int(page_value)
+    async with SessionFactory() as session:
+        district = await _resolve_district(session, district_token)
+        if district is None:
+            await callback.answer("Округ не найден", show_alert=True)
+            return
+        region = await _resolve_region(session, district, region_token)
+        if region is None:
+            await callback.answer("Регион не найден", show_alert=True)
+            return
+    count_text, markup = await _source_list_payload(
+        page=page,
+        region=region,
+        federal_district=district,
+        return_code_prefix=f"r.{district_token}.{region_token}.{{page}}",
+        callback_prefix=f"source:regionitems:{district_token}:{region_token}:{{page}}",
+    )
+    # Replace the generic section button with a region-level back button.
+    markup.inline_keyboard[-1] = [InlineKeyboardButton(
+        text="К регионам",
+        callback_data=f"source:regions:{district_token}:1",
+    )]
+    await edit_or_answer(
+        callback,
+        f"<b>{h(_display_location(region, 'Без региона'))}</b>\n"
+        f"{h(_display_location(district, 'Без округа'))}\n\n{count_text}",
+        markup,
+    )
     await callback.answer()
 
 
@@ -370,34 +582,66 @@ async def source_search(callback: CallbackQuery, state: FSMContext) -> None:
     await state.set_state(SearchState.waiting_query)
     await edit_or_answer(
         callback,
-        "Введите название, ссылку или регион.",
-        kb([[("Отмена", "source:list:1")]]),
+        "Введите ID, название, полную ссылку или часть ссылки.",
+        kb([[("Отмена", "source:menu")]]),
     )
     await callback.answer()
+
+
+async def _render_search_message(message: Message, state: FSMContext, page: int) -> None:
+    data = await state.get_data()
+    query = str(data.get("source_search_query") or "").strip()
+    if not query:
+        await message.answer("Поисковый запрос потерян. Откройте поиск заново.")
+        return
+    count_text, markup = await _source_list_payload(
+        page=page,
+        query=query,
+        return_code_prefix="s.{page}",
+        callback_prefix="source:search:page:{page}",
+    )
+    await message.answer(
+        f"<b>Поиск</b>\nЗапрос: <code>{h(query)}</code>\n\n{count_text}",
+        reply_markup=markup,
+    )
 
 
 @router.message(SearchState.waiting_query, F.text)
 async def source_search_query(message: Message, state: FSMContext) -> None:
     query = (message.text or "").strip()
-    async with SessionFactory() as session:
-        sources, total = await SourceRepository.list(session, page=1, page_size=10, query=query)
-    rows = [
-        [
-            (
-                f"{'VK' if s.platform == Platform.VK else 'TG'} · {(s.title or s.normalized_link)[:35]}",
-                f"source:view:{s.id}:1",
-            )
-        ]
-        for s in sources
-    ]
-    rows.append([("Назад", "source:list:1")])
-    await state.clear()
-    await message.answer(f"Найдено: {total}", reply_markup=kb(rows))
+    if not query:
+        await message.answer("Введите непустой запрос.")
+        return
+    await state.update_data(source_search_query=query)
+    await state.set_state(None)
+    await _render_search_message(message, state, 1)
+
+
+@router.callback_query(F.data.startswith("source:search:page:"))
+async def source_search_page(callback: CallbackQuery, state: FSMContext) -> None:
+    page = int(callback.data.rsplit(":", 1)[-1])
+    data = await state.get_data()
+    query = str(data.get("source_search_query") or "").strip()
+    if not query:
+        await callback.answer("Запрос устарел. Запустите поиск заново.", show_alert=True)
+        return
+    count_text, markup = await _source_list_payload(
+        page=page,
+        query=query,
+        return_code_prefix="s.{page}",
+        callback_prefix="source:search:page:{page}",
+    )
+    await edit_or_answer(
+        callback,
+        f"<b>Поиск</b>\nЗапрос: <code>{h(query)}</code>\n\n{count_text}",
+        markup,
+    )
+    await callback.answer()
 
 
 @router.callback_query(F.data.startswith("source:view:"))
 async def source_view(callback: CallbackQuery) -> None:
-    _, _, source_id, page = callback.data.split(":")
+    _, _, source_id, return_code = callback.data.split(":", 3)
     async with SessionFactory() as session:
         source = await SourceRepository.get(session, int(source_id))
     if not source:
@@ -412,53 +656,59 @@ async def source_view(callback: CallbackQuery) -> None:
     location = " · ".join(x for x in [source.region, source.federal_district] if x) or "Без региона"
     text = (
         f"<b>{h(source.title or source.normalized_link)}</b>\n"
+        f"ID: <code>{source.id}</code>\n"
+        f"Внешний ID: <code>{h(source.external_id or 'не определён')}</code>\n"
         f"{source.platform.value.upper()}\n"
         f"{h(location)}\n\n"
         f"{h(source.normalized_link)}\n"
         f"Статус: {status}\n"
         f"Последняя успешная проверка: {source.last_success_at or 'ещё не было'}"
     )
-    toggle = ("Приостановить", f"source:pause:{source.id}:{page}") if source.status == SourceStatus.ACTIVE else ("Возобновить", f"source:resume:{source.id}:{page}")
+    toggle = (
+        ("Приостановить", f"source:pause:{source.id}:{return_code}")
+        if source.status == SourceStatus.ACTIVE
+        else ("Возобновить", f"source:resume:{source.id}:{return_code}")
+    )
     await edit_or_answer(callback, text, kb([
         [toggle],
         [("Изменить регион", f"source:region:{source.id}")],
-        [("Удалить", f"source:delete:ask:{source.id}:{page}")],
-        [("Назад", f"source:list:{page}")],
+        [("Удалить", f"source:delete:ask:{source.id}:{return_code}")],
+        [("Назад", _source_return_callback(return_code))],
     ]))
     await callback.answer()
 
 
 @router.callback_query(F.data.startswith("source:pause:"))
 async def source_pause(callback: CallbackQuery) -> None:
-    _, _, source_id, page = callback.data.split(":")
+    _, _, source_id, return_code = callback.data.split(":", 3)
     async with SessionFactory() as session:
         async with session.begin():
             await SourceRepository.set_status(session, int(source_id), SourceStatus.PAUSED)
             await AuditRepository.write(session, callback.from_user.id, "source_paused", "source", source_id)
-    callback.data = f"source:view:{source_id}:{page}"
+    callback.data = f"source:view:{source_id}:{return_code}"
     await source_view(callback)
 
 
 @router.callback_query(F.data.startswith("source:resume:"))
 async def source_resume(callback: CallbackQuery) -> None:
-    _, _, source_id, page = callback.data.split(":")
+    _, _, source_id, return_code = callback.data.split(":", 3)
     async with SessionFactory() as session:
         async with session.begin():
             await SourceRepository.set_status(session, int(source_id), SourceStatus.ACTIVE)
             await AuditRepository.write(session, callback.from_user.id, "source_resumed", "source", source_id)
-    callback.data = f"source:view:{source_id}:{page}"
+    callback.data = f"source:view:{source_id}:{return_code}"
     await source_view(callback)
 
 
 @router.callback_query(F.data.startswith("source:delete:ask:"))
 async def source_delete_ask(callback: CallbackQuery) -> None:
-    _, _, _, source_id, page = callback.data.split(":")
+    _, _, _, source_id, return_code = callback.data.split(":", 4)
     await edit_or_answer(
         callback,
         "Удалить источник из общего пула? История дедупликации сохранится.",
         kb([
-            [("Удалить", f"source:delete:yes:{source_id}:{page}")],
-            [("Отмена", f"source:view:{source_id}:{page}")],
+            [("Удалить", f"source:delete:yes:{source_id}:{return_code}")],
+            [("Отмена", f"source:view:{source_id}:{return_code}")],
         ]),
     )
     await callback.answer()
@@ -466,12 +716,16 @@ async def source_delete_ask(callback: CallbackQuery) -> None:
 
 @router.callback_query(F.data.startswith("source:delete:yes:"))
 async def source_delete_yes(callback: CallbackQuery) -> None:
-    _, _, _, source_id, page = callback.data.split(":")
+    _, _, _, source_id, return_code = callback.data.split(":", 4)
     async with SessionFactory() as session:
         async with session.begin():
             await SourceRepository.set_status(session, int(source_id), SourceStatus.DELETED)
             await AuditRepository.write(session, callback.from_user.id, "source_deleted", "source", source_id)
-    await render_source_list(callback, int(page))
+    await edit_or_answer(
+        callback,
+        "✅ Источник удалён.",
+        kb([[("Вернуться", _source_return_callback(return_code))]]),
+    )
     await callback.answer("Удалено")
 
 
@@ -480,7 +734,7 @@ async def source_region_edit(callback: CallbackQuery, state: FSMContext) -> None
     source_id = int(callback.data.rsplit(":", 1)[-1])
     await state.set_state(EditRegionState.waiting_region)
     await state.update_data(source_id=source_id)
-    await edit_or_answer(callback, "Введите новый регион.", kb([[("Отмена", f"source:view:{source_id}:1")]]))
+    await edit_or_answer(callback, "Введите новый регион.", kb([[("Отмена", f"source:view:{source_id}:m")]]))
     await callback.answer()
 
 
@@ -791,10 +1045,21 @@ async def admin_status(callback: CallbackQuery) -> None:
         source_counts = dict((p.value, int(c)) for p, c in (await session.execute(select(Source.platform, func.count()).where(Source.status == SourceStatus.ACTIVE).group_by(Source.platform))).all())
         total_sources = int(await session.scalar(select(func.count()).select_from(Source).where(Source.status != SourceStatus.DELETED)) or 0)
         errors = int(await session.scalar(select(func.count()).select_from(Source).where(Source.status == SourceStatus.ERROR)) or 0)
-        pending_jobs = int(await session.scalar(select(func.count()).select_from(CollectionJob).where(CollectionJob.status.in_([JobStatus.PENDING, JobStatus.RETRY]))) or 0)
+        job_rows = (await session.execute(
+            select(CollectionJob.platform, CollectionJob.status, func.count())
+            .where(CollectionJob.status.in_([JobStatus.PENDING, JobStatus.RETRY, JobStatus.RUNNING]))
+            .group_by(CollectionJob.platform, CollectionJob.status)
+        )).all()
+        job_counts = {(platform.value, status.value): int(count) for platform, status, count in job_rows}
+        pending_jobs = sum(job_counts.values())
         pending_deliveries = int(await session.scalar(select(func.count()).select_from(Delivery).where(Delivery.status.in_([DeliveryStatus.PENDING, DeliveryStatus.RETRY]))) or 0)
         proxy_counts = await ProxyRepository.counts(session)
         account_counts = await CredentialRepository.counts(session)
+    def job_line(platform: str) -> str:
+        pending = job_counts.get((platform, "pending"), 0)
+        retry = job_counts.get((platform, "retry"), 0)
+        running = job_counts.get((platform, "running"), 0)
+        return f"ожидает {pending} · повтор {retry} · выполняется {running}"
     text = (
         "<b>Состояние системы</b>\n\n"
         f"Источники: {total_sources}\n"
@@ -802,6 +1067,8 @@ async def admin_status(callback: CallbackQuery) -> None:
         f"Telegram: {source_counts.get('telegram', 0)}\n"
         f"С ошибкой: {errors}\n\n"
         f"Очередь проверок: {pending_jobs}\n"
+        f"VK: {job_line('vk')}\n"
+        f"Telegram: {job_line('telegram')}\n"
         f"Очередь доставок: {pending_deliveries}\n\n"
         f"Прокси: {h(proxy_counts)}\n"
         f"Аккаунты: {h(account_counts)}"

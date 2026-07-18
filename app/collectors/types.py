@@ -44,5 +44,7 @@ class CollectionResult:
     story_watermark: str = ""
     post_cursor: dict[str, Any] = field(default_factory=dict)
     story_cursor: dict[str, Any] = field(default_factory=dict)
+    window_start: datetime | None = None
+    window_end: datetime | None = None
     needs_immediate_retry: bool = False
     diagnostics: dict[str, Any] = field(default_factory=dict)

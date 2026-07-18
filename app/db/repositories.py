@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+import builtins
 import hashlib
 from collections.abc import Iterable
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from sqlalchemy import and_, func, or_, select, tuple_, update
+from sqlalchemy import String, and_, case, cast, func, or_, select, tuple_, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
@@ -37,7 +38,7 @@ from app.db.models import (
 
 
 def utcnow() -> datetime:
-    return datetime.now(timezone.utc)
+    return datetime.now(UTC)
 
 
 class SettingsRepository:
@@ -156,6 +157,7 @@ class SourceRepository:
                 existing.title = title
             return existing, False
 
+        started_at = utcnow()
         source = Source(
             platform=platform,
             input_link=input_link,
@@ -166,9 +168,9 @@ class SourceRepository:
             title=title,
             external_id=external_id,
             metadata_json=metadata or {},
-            next_check_at=next_check_at or utcnow(),
+            next_check_at=next_check_at or started_at,
         )
-        source.state = SourceState()
+        source.state = SourceState(monitor_from_at=started_at, checkpoint_at=started_at)
         session.add(source)
         await session.flush()
         return source, True
@@ -208,6 +210,7 @@ class SourceRepository:
                     existing.external_id = str(row["external_id"])[:255]
                 updated += 1
                 continue
+            started_at = utcnow()
             source = Source(
                 platform=platform,
                 input_link=row["input_link"],
@@ -218,9 +221,9 @@ class SourceRepository:
                 title=row.get("title", ""),
                 external_id=str(row.get("external_id", "")),
                 metadata_json=row.get("metadata", {}),
-                next_check_at=row.get("next_check_at") or utcnow(),
+                next_check_at=row.get("next_check_at") or started_at,
             )
-            source.state = SourceState()
+            source.state = SourceState(monitor_from_at=started_at, checkpoint_at=started_at)
             session.add(source)
             existing_map[key] = source
             created += 1
@@ -244,6 +247,9 @@ class SourceRepository:
         query: str = "",
         platform: Platform | None = None,
         status: SourceStatus | None = None,
+        region: str | None = None,
+        federal_district: str | None = None,
+        alphabetical: bool = False,
     ) -> tuple[list[Source], int]:
         filters = [Source.status != SourceStatus.DELETED]
         if query:
@@ -251,23 +257,74 @@ class SourceRepository:
             filters.append(
                 or_(
                     Source.title.ilike(token),
+                    Source.input_link.ilike(token),
                     Source.normalized_link.ilike(token),
+                    Source.external_id.ilike(token),
                     Source.region.ilike(token),
+                    cast(Source.id, String).ilike(token),
                 )
             )
         if platform:
             filters.append(Source.platform == platform)
         if status:
             filters.append(Source.status == status)
+        if region is not None:
+            filters.append(Source.region == region)
+        if federal_district is not None:
+            filters.append(Source.federal_district == federal_district)
         total = int(await session.scalar(select(func.count()).select_from(Source).where(*filters)) or 0)
+        alphabetical_key = func.lower(
+            func.coalesce(func.nullif(Source.title, ""), Source.normalized_link)
+        )
+        if query:
+            clean_query = query.strip()
+            order_by = (
+                case(
+                    (cast(Source.id, String) == clean_query, 0),
+                    (func.lower(Source.external_id) == clean_query.lower(), 1),
+                    else_=2,
+                ),
+                alphabetical_key,
+                Source.id,
+            )
+        elif alphabetical:
+            order_by = (alphabetical_key, Source.id)
+        else:
+            order_by = (Source.region, Source.title, Source.id)
         rows = await session.scalars(
             select(Source)
             .where(*filters)
-            .order_by(Source.region, Source.title, Source.id)
+            .order_by(*order_by)
             .offset(max(0, page - 1) * page_size)
             .limit(page_size)
         )
         return list(rows), total
+
+    @staticmethod
+    async def district_counts(session: AsyncSession) -> builtins.list[tuple[str, int]]:
+        rows = await session.execute(
+            select(Source.federal_district, func.count())
+            .where(Source.status != SourceStatus.DELETED)
+            .group_by(Source.federal_district)
+            .order_by(func.lower(Source.federal_district))
+        )
+        return [(district or "", int(count)) for district, count in rows]
+
+    @staticmethod
+    async def region_counts(
+        session: AsyncSession,
+        federal_district: str,
+    ) -> builtins.list[tuple[str, int]]:
+        rows = await session.execute(
+            select(Source.region, func.count())
+            .where(
+                Source.status != SourceStatus.DELETED,
+                Source.federal_district == federal_district,
+            )
+            .group_by(Source.region)
+            .order_by(func.lower(Source.region))
+        )
+        return [(region or "", int(count)) for region, count in rows]
 
     @staticmethod
     async def set_status(session: AsyncSession, source_id: int, status: SourceStatus) -> None:
@@ -293,15 +350,18 @@ class SourceRepository:
         normalized_link: str = "",
         last_item_at: datetime | None = None,
         diagnostics: dict[str, Any] | None = None,
+        completed: bool = True,
     ) -> None:
         source = await session.get(Source, source_id)
         if not source:
             return
         source.last_check_at = utcnow()
-        source.last_success_at = utcnow()
-        source.consecutive_failures = 0
-        source.last_error_code = ""
-        source.last_error_text = ""
+        if completed:
+            source.last_success_at = utcnow()
+        if completed:
+            source.consecutive_failures = 0
+            source.last_error_code = ""
+            source.last_error_text = ""
         if title:
             source.title = title[:500]
         if external_id:
@@ -424,6 +484,24 @@ class JobRepository:
         )
 
     @staticmethod
+    async def extend_lease(
+        session: AsyncSession,
+        job_id: int,
+        worker_id: str,
+        lease_seconds: int,
+    ) -> bool:
+        result = await session.execute(
+            update(CollectionJob)
+            .where(
+                CollectionJob.id == job_id,
+                CollectionJob.status == JobStatus.RUNNING,
+                CollectionJob.worker_id == worker_id,
+            )
+            .values(locked_until=utcnow() + timedelta(seconds=lease_seconds))
+        )
+        return bool(result.rowcount)
+
+    @staticmethod
     async def retry(
         session: AsyncSession,
         job_id: int,
@@ -462,7 +540,6 @@ class ItemRepository:
         *,
         source: Source,
         items: list[CollectedItem],
-        bootstrap: bool,
         signal_chat_id: int | None,
     ) -> tuple[int, int]:
         inserted = 0
@@ -505,7 +582,7 @@ class ItemRepository:
                         metadata_json=media_payload.metadata,
                     )
                 )
-            if not bootstrap and signal_chat_id:
+            if signal_chat_id:
                 session.add(
                     Delivery(
                         item_id=item_id,
@@ -529,6 +606,8 @@ class ItemRepository:
         story_cursor: dict[str, Any] | None = None,
         recent_post_keys: list[str] | None = None,
         recent_story_keys: list[str] | None = None,
+        monitor_from_at: datetime | None = None,
+        checkpoint_at: datetime | None = None,
     ) -> None:
         state = await session.get(SourceState, source_id)
         if not state:
@@ -536,6 +615,10 @@ class ItemRepository:
             session.add(state)
         if bootstrap_completed is not None:
             state.bootstrap_completed = bootstrap_completed
+        if monitor_from_at is not None:
+            state.monitor_from_at = monitor_from_at
+        if checkpoint_at is not None:
+            state.checkpoint_at = checkpoint_at
         if post_watermark is not None:
             state.post_watermark = post_watermark
         if story_watermark is not None:

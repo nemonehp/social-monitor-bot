@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 from sqlalchemy import (
@@ -32,7 +32,7 @@ from app.db.enums import (
 
 
 def utcnow() -> datetime:
-    return datetime.now(timezone.utc)
+    return datetime.now(UTC)
 
 
 class AppSetting(Base, TimestampMixin):
@@ -91,6 +91,8 @@ class SourceState(Base, TimestampMixin):
     source_id: Mapped[int] = mapped_column(
         BigInteger, ForeignKey("sources.id", ondelete="CASCADE"), primary_key=True
     )
+    monitor_from_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+    checkpoint_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
     bootstrap_completed: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     post_watermark: Mapped[str] = mapped_column(String(255), default="", nullable=False)
     story_watermark: Mapped[str] = mapped_column(String(255), default="", nullable=False)

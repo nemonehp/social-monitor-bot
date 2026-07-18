@@ -15,7 +15,7 @@ def kb(rows: list[list[tuple[str, str]]]) -> InlineKeyboardMarkup:
 def main_menu(admin: bool) -> InlineKeyboardMarkup:
     rows = [
         [("Добавить источник", "source:add")],
-        [("Источники", "source:list:1")],
+        [("Источники", "source:menu")],
     ]
     if admin:
         rows.append([("Управление", "admin:menu")])

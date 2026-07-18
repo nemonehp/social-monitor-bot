@@ -1,4 +1,6 @@
 .env
+.env.*
+!.env.example
 __pycache__/
 *.py[cod]
 .pytest_cache/
@@ -8,4 +10,10 @@ __pycache__/
 data/media/*
 !data/media/.gitkeep
 *.sqlite
+*.sqlite3
+*.db
+*.dump
+*.session
+*.session-journal
 *.log
+backups/

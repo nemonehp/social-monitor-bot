@@ -28,6 +28,10 @@ class Settings(BaseSettings):
     vk_max_pages_per_run: int = 20
     vk_per_token_min_interval_seconds: float = 0.35
     tg_batch_messages: int = 500
+    collection_overlap_seconds: int = 120
+    media_max_previews_per_item: int = 4
+    media_max_preview_bytes: int = 2_000_000
+    media_max_image_edge: int = 1280
     media_retention_hours: int = 72
     job_history_days: int = 7
     delivery_history_days: int = 30

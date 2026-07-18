@@ -23,7 +23,7 @@ from app.db.repositories import CredentialRepository, JobRepository, SourceRepos
 from app.db.session import SessionFactory
 from app.security import SecretBox
 from app.services.network import check_direct_ip
-from app.workers.common import persist_collection_result
+from app.workers.common import keep_job_lease, persist_collection_result
 
 logger = structlog.get_logger()
 
@@ -85,19 +85,29 @@ class TgWorker:
                         await asyncio.sleep(0.75)
                         continue
 
-                    result = await self.collector.collect(source, client)
-                    async with SessionFactory() as session:
-                        async with session.begin():
-                            source = await SourceRepository.get(session, source.id)
-                            if not source:
-                                await JobRepository.complete(session, job.id)
-                                continue
-                            inserted, deliveries = await persist_collection_result(session, source, result)
-                            await CredentialRepository.mark_success(session, credential.id)
-                            if result.needs_immediate_retry:
-                                await JobRepository.retry(session, job.id, "continuing Telegram catch-up", delay_seconds=1)
-                            else:
-                                await JobRepository.complete(session, job.id)
+                    async with keep_job_lease(
+                        job.id,
+                        worker_id,
+                        self.settings.job_lease_seconds,
+                    ):
+                        result = await self.collector.collect(source, client)
+                        async with SessionFactory() as session:
+                            async with session.begin():
+                                source = await SourceRepository.get(session, source.id)
+                                if not source:
+                                    await JobRepository.complete(session, job.id)
+                                    continue
+                                inserted, deliveries = await persist_collection_result(session, source, result)
+                                await CredentialRepository.mark_success(session, credential.id)
+                                if result.needs_immediate_retry:
+                                    await JobRepository.retry(
+                                        session,
+                                        job.id,
+                                        "continuing bounded Telegram scan",
+                                        delay_seconds=1,
+                                    )
+                                else:
+                                    await JobRepository.complete(session, job.id)
                     logger.info(
                         "tg_job_done",
                         job_id=job.id,

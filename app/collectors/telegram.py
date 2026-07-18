@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import re
 from collections import OrderedDict
-from datetime import datetime, timezone
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from telethon import TelegramClient
@@ -21,7 +21,6 @@ from app.config import Settings
 from app.db.enums import ItemType, Platform
 from app.db.models import Source
 from app.utils.text import clean_text
-
 
 BAD_SESSION_ERRORS = {
     "AuthKeyUnregisteredError", "AuthKeyInvalidError", "AuthKeyDuplicatedError",
@@ -86,9 +85,9 @@ def _utc(value: Any) -> datetime | None:
     if value is None:
         return None
     if isinstance(value, datetime):
-        return value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value.astimezone(timezone.utc)
+        return value.replace(tzinfo=UTC) if value.tzinfo is None else value.astimezone(UTC)
     if isinstance(value, (int, float)):
-        return datetime.fromtimestamp(value, tz=timezone.utc)
+        return datetime.fromtimestamp(value, tz=UTC)
     return None
 
 
@@ -100,7 +99,8 @@ def _jsonable(value: Any, depth: int = 5) -> Any:
     if isinstance(value, bytes):
         return value.hex()[:512]
     if isinstance(value, datetime):
-        return _utc(value).isoformat() if _utc(value) else str(value)
+        converted = _utc(value)
+        return converted.isoformat() if converted else str(value)
     if isinstance(value, dict):
         return {str(k): _jsonable(v, depth - 1) for k, v in list(value.items())[:200]}
     if isinstance(value, (list, tuple, set)):
@@ -117,9 +117,31 @@ class TelegramCollector:
     def __init__(self, settings: Settings):
         self.settings = settings
 
+    def _window(self, source: Source) -> tuple[datetime, datetime, bool]:
+        state = source.state
+        first_run = not state or not state.bootstrap_completed
+        now = datetime.now(UTC)
+        frozen_end = None
+        if state and state.post_cursor:
+            raw_end = state.post_cursor.get("window_end")
+            if raw_end:
+                try:
+                    frozen_end = datetime.fromisoformat(str(raw_end)).astimezone(UTC)
+                except ValueError:
+                    frozen_end = None
+        base = (
+            (state.monitor_from_at if state else None)
+            or (state.checkpoint_at if state else None)
+            or source.created_at
+            or now
+        )
+        if not first_run and state and state.checkpoint_at:
+            base = state.checkpoint_at - timedelta(seconds=self.settings.collection_overlap_seconds)
+        return base.astimezone(UTC), frozen_end or now, first_run
+
     async def collect(self, source: Source, client: TelegramClient) -> CollectionResult:
         state = source.state
-        bootstrap = not state or not state.bootstrap_completed
+        window_start, window_end, first_run = self._window(source)
         username = source.normalized_link.rstrip("/").split("/")[-1]
         try:
             entity = await client.get_entity(username)
@@ -134,15 +156,13 @@ class TelegramCollector:
         needs_retry = False
         old_watermark = int(state.post_watermark or 0) if state and str(state.post_watermark).isdigit() else 0
         new_watermark = old_watermark
+        post_cursor = dict(state.post_cursor or {}) if state else {}
         post_keys: list[str] = []
 
         if entity_type not in {"user", "bot"}:
             try:
-                if bootstrap or old_watermark == 0:
-                    messages = list(await client.get_messages(entity, limit=30))
-                    messages.reverse()
-                else:
-                    messages = []
+                if old_watermark:
+                    messages: list[Any] = []
                     async for message in client.iter_messages(
                         entity,
                         min_id=old_watermark,
@@ -151,39 +171,102 @@ class TelegramCollector:
                     ):
                         messages.append(message)
                     if len(messages) > self.settings.tg_batch_messages:
-                        selected = messages[: self.settings.tg_batch_messages]
-                        boundary_group = getattr(selected[-1], "grouped_id", None) if selected else None
-                        if boundary_group:
-                            for extra in messages[self.settings.tg_batch_messages :]:
-                                if getattr(extra, "grouped_id", None) == boundary_group:
-                                    selected.append(extra)
-                                else:
-                                    break
-                        messages = selected
+                        messages = self._keep_album_boundary(messages, self.settings.tg_batch_messages)
                         needs_retry = True
-                grouped = self._group_messages(messages)
+                    filtered = [
+                        message for message in messages
+                        if (published := _utc(getattr(message, "date", None)))
+                        and window_start < published <= window_end
+                    ]
+                    bounded_messages = [
+                        message
+                        for message in messages
+                        if (published := _utc(getattr(message, "date", None)))
+                        and published <= window_end
+                    ]
+                    if bounded_messages:
+                        new_watermark = max(
+                            new_watermark,
+                            max(int(getattr(message, "id", 0) or 0) for message in bounded_messages),
+                        )
+                    post_cursor = {}
+                else:
+                    # First monitoring pass: walk backwards only until monitor_from_at.
+                    # A cursor allows safe continuation without importing older history.
+                    offset_id = int(post_cursor.get("offset_id") or 0)
+                    candidate_watermark = int(post_cursor.get("candidate_watermark") or 0)
+                    page = list(
+                        await client.get_messages(
+                            entity,
+                            limit=self.settings.tg_batch_messages,
+                            offset_id=offset_id,
+                        )
+                    )
+                    page = [message for message in page if message and getattr(message, "id", None)]
+                    bounded_page = [
+                        message
+                        for message in page
+                        if (published := _utc(getattr(message, "date", None)))
+                        and published <= window_end
+                    ]
+                    if bounded_page:
+                        candidate_watermark = max(
+                            candidate_watermark,
+                            max(int(getattr(message, "id", 0) or 0) for message in bounded_page),
+                        )
+                    barrier_reached = len(page) < self.settings.tg_batch_messages
+                    filtered = []
+                    for message in page:
+                        published = _utc(getattr(message, "date", None))
+                        if published and published <= window_start:
+                            barrier_reached = True
+                            continue
+                        if published and published <= window_end:
+                            filtered.append(message)
+                    if barrier_reached or not page:
+                        new_watermark = max(new_watermark, candidate_watermark)
+                        post_cursor = {}
+                    else:
+                        oldest_id = min(int(getattr(message, "id", 0) or 0) for message in page)
+                        post_cursor = {
+                            "offset_id": oldest_id,
+                            "candidate_watermark": candidate_watermark,
+                            "window_end": window_end.isoformat(),
+                        }
+                        needs_retry = True
+                    filtered.sort(key=lambda message: int(getattr(message, "id", 0) or 0))
+
+                grouped = self._group_messages(filtered)
                 for group in grouped.values():
                     item = await self._build_post(client, entity, username, group)
                     if item:
                         items.append(item)
                         post_keys.append(item.item_key)
-                        new_watermark = max(new_watermark, max(int(getattr(m, "id", 0) or 0) for m in group))
             except Exception as exc:
                 raise _classify(exc) from exc
 
         story_keys: list[str] = []
-        max_story_id = int(state.story_watermark or 0) if state and str(state.story_watermark).isdigit() else 0
+        known_story_keys = set(state.recent_story_keys or []) if state else set()
+        old_story_watermark = int(state.story_watermark or 0) if state and str(state.story_watermark).isdigit() else 0
+        max_story_id = old_story_watermark
         story_access_attempts = int((state.story_cursor or {}).get("access_attempts", 0)) if state else 0
         story_needs_retry = False
         story_cursor: dict[str, Any] = {}
         try:
-            stories = await self._collect_stories(client, entity)
-            for story, source_kind in stories:
-                item = await self._build_story(client, entity, username, story, source_kind)
+            stories = await self._collect_active_stories(client, entity)
+            for story in stories:
+                story_id = int(getattr(story, "id", 0) or 0)
+                max_story_id = max(max_story_id, story_id)
+                story_key = f"tg:story:{entity_id}:{story_id}"
+                if story_key in known_story_keys:
+                    continue
+                published = _utc(getattr(story, "date", None))
+                if not published or not (window_start < published <= window_end):
+                    continue
+                item = await self._build_story(client, entity, username, story)
                 if item:
                     items.append(item)
                     story_keys.append(item.item_key)
-                    max_story_id = max(max_story_id, int(getattr(story, "id", 0) or 0))
         except Exception as exc:
             # Stories failure must not discard successfully collected posts.
             story_error = _classify(exc)
@@ -201,22 +284,38 @@ class TelegramCollector:
             items=items,
             post_watermark=str(new_watermark),
             story_watermark=str(max_story_id),
-            post_cursor={},
+            post_cursor=post_cursor,
             story_cursor=story_cursor,
+            window_start=window_start,
+            window_end=window_end,
             needs_immediate_retry=needs_retry or story_needs_retry,
             diagnostics={
                 "entity_type": entity_type,
-                "bootstrap": bootstrap,
+                "first_run": first_run,
+                "window_start": window_start.isoformat(),
+                "window_end": window_end.isoformat(),
                 "post_keys": post_keys[-20:],
                 "story_keys": story_keys[-20:],
-                "batch_full": needs_retry,
+                "batch_continuation": needs_retry,
                 "story_needs_retry": story_needs_retry,
             },
         )
 
     @staticmethod
-    def _group_messages(messages: list[Any]) -> "OrderedDict[str, list[Any]]":
-        groups: "OrderedDict[str, list[Any]]" = OrderedDict()
+    def _keep_album_boundary(messages: list[Any], limit: int) -> list[Any]:
+        selected = messages[:limit]
+        boundary_group = getattr(selected[-1], "grouped_id", None) if selected else None
+        if boundary_group:
+            for extra in messages[limit:]:
+                if getattr(extra, "grouped_id", None) == boundary_group:
+                    selected.append(extra)
+                else:
+                    break
+        return selected
+
+    @staticmethod
+    def _group_messages(messages: list[Any]) -> OrderedDict[str, list[Any]]:
+        groups: OrderedDict[str, list[Any]] = OrderedDict()
         for message in messages:
             if message is None or not getattr(message, "id", None):
                 continue
@@ -234,15 +333,18 @@ class TelegramCollector:
     ) -> CollectedItem | None:
         if not messages:
             return None
-        ordered = sorted(messages, key=lambda m: int(getattr(m, "id", 0) or 0))
+        ordered = sorted(messages, key=lambda message: int(getattr(message, "id", 0) or 0))
         representative = next(
-            (m for m in ordered if clean_text(getattr(m, "message", "") or getattr(m, "raw_text", ""))),
+            (
+                message for message in ordered
+                if clean_text(getattr(message, "message", "") or getattr(message, "raw_text", ""))
+            ),
             ordered[0],
         )
         if not any(
-            clean_text(getattr(m, "message", "") or getattr(m, "raw_text", ""))
-            or getattr(m, "media", None)
-            for m in ordered
+            clean_text(getattr(message, "message", "") or getattr(message, "raw_text", ""))
+            or getattr(message, "media", None)
+            for message in ordered
         ):
             return None
         chat_id = str(getattr(entity, "id", ""))
@@ -253,7 +355,7 @@ class TelegramCollector:
         else:
             key = f"tg:post:{chat_id}:msg:{representative.id}"
             external_id = str(representative.id)
-        media = await self._download_message_media(client, key, ordered)
+        media = await self._download_message_previews(client, key, ordered)
         return CollectedItem(
             platform=Platform.TELEGRAM,
             item_type=ItemType.POST,
@@ -265,84 +367,112 @@ class TelegramCollector:
             media=media,
             raw={
                 "representative": _jsonable(representative),
-                "message_ids": [int(getattr(m, "id", 0) or 0) for m in ordered],
+                "message_ids": [int(getattr(message, "id", 0) or 0) for message in ordered],
                 "grouped_id": str(grouped_id or ""),
             },
         )
 
-    async def _download_message_media(
-        self, client: TelegramClient, item_key: str, messages: list[Any]
+    def _select_thumb(self, media: Any) -> Any | None:
+        sizes = list(getattr(media, "sizes", None) or getattr(media, "thumbs", None) or [])
+        if not sizes:
+            return None
+        measured: list[tuple[int, int, Any]] = []
+        for index, size in enumerate(sizes):
+            width = int(getattr(size, "w", 0) or 0)
+            height = int(getattr(size, "h", 0) or 0)
+            if not width or not height:
+                continue
+            measured.append((width * height, max(width, height), index))
+        if not measured:
+            return 0
+        within_limit = [row for row in measured if row[1] <= self.settings.media_max_image_edge]
+        return max(within_limit or measured, key=lambda row: row[0])[2]
+
+    async def _download_preview_bytes(self, client: TelegramClient, media: Any) -> bytes | None:
+        inner = getattr(media, "photo", None) or getattr(media, "document", None) or media
+        thumb = self._select_thumb(inner)
+        # Videos/documents are never downloaded without a thumbnail.
+        is_photo = "Photo" in type(inner).__name__
+        if thumb is None and not is_photo:
+            return None
+        try:
+            data = await client.download_media(media, file=bytes, thumb=thumb)
+        except Exception:
+            return None
+        if not isinstance(data, (bytes, bytearray)) or not data:
+            return None
+        if len(data) > self.settings.media_max_preview_bytes:
+            return None
+        return bytes(data)
+
+    async def _download_message_previews(
+        self,
+        client: TelegramClient,
+        item_key: str,
+        messages: list[Any],
     ) -> list[MediaPayload]:
         safe_key = re.sub(r"[^A-Za-z0-9_.-]+", "_", item_key)
         target_dir = self.settings.media_root / "telegram" / safe_key
-        target_dir.mkdir(parents=True, exist_ok=True)
         result: list[MediaPayload] = []
-        for index, message in enumerate(messages):
-            if not getattr(message, "media", None):
+        for message in messages:
+            if len(result) >= self.settings.media_max_previews_per_item:
+                break
+            media_obj = getattr(message, "photo", None) or getattr(message, "document", None)
+            if media_obj is None:
                 continue
-            try:
-                path = await client.download_media(message, file=str(target_dir / f"{index:02d}"))
-            except Exception:
-                path = None
-            media_type = "document"
             if getattr(message, "photo", None):
                 media_type = "photo"
             elif getattr(message, "video", None):
-                media_type = "video"
-            elif getattr(message, "voice", None):
-                media_type = "audio"
+                media_type = "video_preview"
+            else:
+                media_type = "document_preview"
+            data = await self._download_preview_bytes(client, media_obj)
+            if not data:
+                continue
+            target_dir.mkdir(parents=True, exist_ok=True)
+            path = target_dir / f"{len(result):02d}.jpg"
+            path.write_bytes(data)
             result.append(
                 MediaPayload(
                     media_type=media_type,
-                    local_path=str(path or ""),
-                    metadata={"message_id": int(getattr(message, "id", 0) or 0)},
+                    local_path=str(path),
+                    mime_type="image/jpeg",
+                    metadata={"message_id": int(getattr(message, "id", 0) or 0), "preview_only": True},
                 )
             )
         return result
 
-    async def _collect_stories(self, client: TelegramClient, entity: Any) -> list[tuple[Any, str]]:
+    async def _collect_active_stories(self, client: TelegramClient, entity: Any) -> list[Any]:
         from telethon.tl import functions
 
         if not hasattr(functions, "stories"):
             return []
         stories_api = functions.stories
         input_peer = await client.get_input_entity(entity)
-        result: list[tuple[Any, str]] = []
-
         active_response = await client(stories_api.GetPeerStoriesRequest(peer=input_peer))
         active = self._story_items(active_response)
-        skipped_ids = [int(getattr(x, "id", 0) or 0) for x in active if type(x).__name__ == "StoryItemSkipped"]
+        skipped_ids = [
+            int(getattr(story, "id", 0) or 0)
+            for story in active
+            if type(story).__name__ == "StoryItemSkipped"
+        ]
         if skipped_ids and hasattr(stories_api, "GetStoriesByIDRequest"):
             try:
-                full_response = await client(stories_api.GetStoriesByIDRequest(peer=input_peer, id=skipped_ids))
-                full = {int(getattr(x, "id", 0) or 0): x for x in self._story_items(full_response)}
-                active = [full.get(int(getattr(x, "id", 0) or 0), x) for x in active]
+                full_response = await client(
+                    stories_api.GetStoriesByIDRequest(peer=input_peer, id=skipped_ids)
+                )
+                full = {
+                    int(getattr(story, "id", 0) or 0): story
+                    for story in self._story_items(full_response)
+                }
+                active = [full.get(int(getattr(story, "id", 0) or 0), story) for story in active]
             except Exception:
                 pass
-        result.extend((story, "active") for story in active)
-
-        if hasattr(stories_api, "GetPinnedStoriesRequest"):
-            offset_id = 0
-            scanned = 0
-            while scanned < 1000:
-                response = await client(
-                    stories_api.GetPinnedStoriesRequest(peer=input_peer, offset_id=offset_id, limit=100)
-                )
-                page = self._story_items(response)
-                if not page:
-                    break
-                result.extend((story, "pinned") for story in page)
-                scanned += len(page)
-                last_id = int(getattr(page[-1], "id", 0) or 0)
-                if not last_id or last_id == offset_id or len(page) < 100:
-                    break
-                offset_id = last_id
-
-        unique: dict[int, tuple[Any, str]] = {}
-        for story, source_kind in result:
+        unique: dict[int, Any] = {}
+        for story in active:
             story_id = int(getattr(story, "id", 0) or 0)
             if story_id and self._is_full_story(story):
-                unique[story_id] = (story, source_kind)
+                unique[story_id] = story
         return list(unique.values())
 
     @staticmethod
@@ -377,7 +507,6 @@ class TelegramCollector:
         entity: Any,
         username: str,
         story: Any,
-        source_kind: str,
     ) -> CollectedItem | None:
         story_id = int(getattr(story, "id", 0) or 0)
         if not story_id:
@@ -387,15 +516,22 @@ class TelegramCollector:
         media: list[MediaPayload] = []
         media_obj = getattr(story, "media", None)
         if media_obj is not None:
-            safe_key = re.sub(r"[^A-Za-z0-9_.-]+", "_", key)
-            target_dir = self.settings.media_root / "telegram" / safe_key
-            target_dir.mkdir(parents=True, exist_ok=True)
-            try:
-                path = await client.download_media(media_obj, file=str(target_dir / "story"))
-            except Exception:
-                path = None
-            media_type = "photo" if "Photo" in type(media_obj).__name__ else "video" if "Document" in type(media_obj).__name__ else "document"
-            media.append(MediaPayload(media_type=media_type, local_path=str(path or "")))
+            data = await self._download_preview_bytes(client, media_obj)
+            if data:
+                safe_key = re.sub(r"[^A-Za-z0-9_.-]+", "_", key)
+                target_dir = self.settings.media_root / "telegram" / safe_key
+                target_dir.mkdir(parents=True, exist_ok=True)
+                path = target_dir / "story.jpg"
+                path.write_bytes(data)
+                media_type = "photo" if "Photo" in type(media_obj).__name__ else "video_preview"
+                media.append(
+                    MediaPayload(
+                        media_type=media_type,
+                        local_path=str(path),
+                        mime_type="image/jpeg",
+                        metadata={"preview_only": True},
+                    )
+                )
         return CollectedItem(
             platform=Platform.TELEGRAM,
             item_type=ItemType.STORY,
@@ -404,7 +540,7 @@ class TelegramCollector:
             original_url=f"https://t.me/{username}/s/{story_id}" if username else "",
             text=clean_text(getattr(story, "caption", "")),
             published_at=_utc(getattr(story, "date", None)),
-            is_pinned=source_kind == "pinned",
+            is_pinned=False,
             media=media,
-            raw={"story": _jsonable(story), "source_kind": source_kind},
+            raw={"story": _jsonable(story), "source_kind": "active"},
         )

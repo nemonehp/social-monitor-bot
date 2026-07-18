@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
-from datetime import datetime, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -15,8 +15,8 @@ from app.collectors.errors import (
     CredentialDeadError,
     FeatureUnavailableError,
     NetworkCollectorError,
-    ProxyUnavailableError,
     NotFoundError,
+    ProxyUnavailableError,
     RateLimitedError,
     RetryableCollectorError,
 )
@@ -26,7 +26,6 @@ from app.db.enums import ItemType, Platform
 from app.db.models import Source
 from app.services.network import proxy_session
 from app.utils.text import clean_text
-
 
 TOKEN_DEAD_CODES = {5, 14, 17, 27, 28}
 RETRY_CODES = {6, 9, 10, 29}
@@ -85,7 +84,7 @@ class VkCollector:
                 data = json.loads(text)
         except ProxyUnavailableError:
             raise
-        except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+        except (TimeoutError, aiohttp.ClientError) as exc:
             raise NetworkCollectorError(str(exc)) from exc
         except json.JSONDecodeError as exc:
             raise RetryableCollectorError(str(exc)) from exc
@@ -192,53 +191,72 @@ class VkCollector:
         screen_name = str(group.get("screen_name") or screen_name)
         return owner_id, str(group.get("type") or owner_type), title, screen_name
 
-    @staticmethod
-    def _largest_photo(photo: dict[str, Any]) -> tuple[str, int | None, int | None]:
-        sizes = photo.get("sizes") or []
-        if not sizes:
-            url = str(photo.get("photo_2560") or photo.get("photo_1280") or photo.get("photo_807") or photo.get("url") or "")
-            return url, None, None
-        best = max(
-            (x for x in sizes if isinstance(x, dict) and x.get("url")),
+    def _best_photo(self, photo: dict[str, Any]) -> tuple[str, int | None, int | None]:
+        sizes = [x for x in (photo.get("sizes") or []) if isinstance(x, dict) and x.get("url")]
+        if sizes:
+            within = [
+                x for x in sizes
+                if max(int(x.get("width") or 0), int(x.get("height") or 0)) <= self.settings.media_max_image_edge
+            ]
+            candidates = within or sizes
+            best = max(
+                candidates,
+                key=lambda x: int(x.get("width") or 0) * int(x.get("height") or 0),
+            )
+            return str(best.get("url") or ""), best.get("width"), best.get("height")
+        url = str(photo.get("photo_807") or photo.get("photo_604") or photo.get("url") or "")
+        return url, None, None
+
+    def _best_image(self, images: Any) -> dict[str, Any]:
+        candidates = [x for x in (images or []) if isinstance(x, dict) and x.get("url")]
+        if not candidates:
+            return {}
+        within = [
+            x for x in candidates
+            if max(int(x.get("width") or 0), int(x.get("height") or 0)) <= self.settings.media_max_image_edge
+        ]
+        return max(
+            within or candidates,
             key=lambda x: int(x.get("width") or 0) * int(x.get("height") or 0),
-            default={},
         )
-        return str(best.get("url") or ""), best.get("width"), best.get("height")
 
     def _media_from_attachments(self, attachments: Any) -> list[MediaPayload]:
         result: list[MediaPayload] = []
         if not isinstance(attachments, list):
             return result
         for attachment in attachments:
+            if len(result) >= self.settings.media_max_previews_per_item:
+                break
             if not isinstance(attachment, dict):
                 continue
             kind = str(attachment.get("type") or "unknown")
             obj = attachment.get(kind) or {}
             if kind == "photo":
-                url, width, height = self._largest_photo(obj)
-                result.append(MediaPayload("photo", remote_url=url, width=width, height=height))
+                url, width, height = self._best_photo(obj)
+                if url:
+                    result.append(MediaPayload("photo", preview_url=url, width=width, height=height))
             elif kind == "video":
-                images = obj.get("image") or obj.get("first_frame") or []
-                best = max(
-                    (x for x in images if isinstance(x, dict) and x.get("url")),
-                    key=lambda x: int(x.get("width") or 0) * int(x.get("height") or 0),
-                    default={},
-                )
+                best = self._best_image(obj.get("image") or obj.get("first_frame") or [])
                 owner_id = obj.get("owner_id")
                 video_id = obj.get("id")
-                video_url = f"https://vk.com/video{owner_id}_{video_id}" if owner_id is not None and video_id is not None else ""
-                result.append(
-                    MediaPayload(
-                        "video_preview",
-                        remote_url=video_url,
-                        preview_url=str(best.get("url") or ""),
-                        width=best.get("width"),
-                        height=best.get("height"),
-                    )
+                video_url = (
+                    f"https://vk.com/video{owner_id}_{video_id}"
+                    if owner_id is not None and video_id is not None
+                    else ""
                 )
+                if best.get("url"):
+                    result.append(
+                        MediaPayload(
+                            "video_preview",
+                            remote_url=video_url,
+                            preview_url=str(best.get("url") or ""),
+                            width=best.get("width"),
+                            height=best.get("height"),
+                            metadata={"preview_only": True},
+                        )
+                    )
             elif kind == "link":
-                photo = obj.get("photo") or {}
-                url, width, height = self._largest_photo(photo)
+                url, width, height = self._best_photo(obj.get("photo") or {})
                 if url:
                     result.append(
                         MediaPayload(
@@ -247,10 +265,9 @@ class VkCollector:
                             preview_url=url,
                             width=width,
                             height=height,
+                            metadata={"preview_only": True},
                         )
                     )
-            else:
-                result.append(MediaPayload(kind, remote_url=str(obj.get("url") or ""), metadata={"raw": obj}))
         return result
 
     async def _download_images(
@@ -262,28 +279,61 @@ class VkCollector:
     ) -> None:
         safe_key = re.sub(r"[^A-Za-z0-9_.-]+", "_", item_key)
         target_dir = self.settings.media_root / "vk" / safe_key
-        target_dir.mkdir(parents=True, exist_ok=True)
-        for index, payload in enumerate(media):
-            url = payload.preview_url or (payload.remote_url if payload.media_type == "photo" else "")
+        downloaded = 0
+        for payload in media:
+            if downloaded >= self.settings.media_max_previews_per_item:
+                break
+            url = payload.preview_url
             if not url or not url.startswith(("http://", "https://")):
                 continue
-            suffix = Path(urlparse(url).path).suffix.lower()
-            if suffix not in {".jpg", ".jpeg", ".png", ".webp"}:
-                suffix = ".jpg"
-            path = target_dir / f"{index:02d}{suffix}"
             try:
                 async with session.get(url, proxy=request_proxy) as response:
                     if response.status != 200:
                         continue
-                    content = await response.read()
+                    declared = int(response.headers.get("Content-Length") or 0)
+                    if declared and declared > self.settings.media_max_preview_bytes:
+                        continue
+                    content = bytearray()
+                    async for chunk in response.content.iter_chunked(64 * 1024):
+                        content.extend(chunk)
+                        if len(content) > self.settings.media_max_preview_bytes:
+                            content.clear()
+                            break
                     if not content:
                         continue
+                    target_dir.mkdir(parents=True, exist_ok=True)
+                    suffix = Path(urlparse(url).path).suffix.lower()
+                    if suffix not in {".jpg", ".jpeg", ".png", ".webp"}:
+                        suffix = ".jpg"
+                    path = target_dir / f"{downloaded:02d}{suffix}"
                     path.write_bytes(content)
                     payload.local_path = str(path)
                     payload.mime_type = response.headers.get("Content-Type", "image/jpeg").split(";", 1)[0]
+                    downloaded += 1
             except Exception:
-                # The post remains deliverable even if a single attachment cannot be downloaded.
                 continue
+
+    def _window(self, source: Source) -> tuple[datetime, datetime, bool]:
+        state = source.state
+        first_run = not state or not state.bootstrap_completed
+        now = datetime.now(UTC)
+        frozen_end = None
+        if state and state.post_cursor:
+            raw_end = state.post_cursor.get("window_end")
+            if raw_end:
+                try:
+                    frozen_end = datetime.fromisoformat(str(raw_end)).astimezone(UTC)
+                except ValueError:
+                    frozen_end = None
+        base = (
+            (state.monitor_from_at if state else None)
+            or (state.checkpoint_at if state else None)
+            or source.created_at
+            or now
+        )
+        if not first_run and state and state.checkpoint_at:
+            base = state.checkpoint_at - timedelta(seconds=self.settings.collection_overlap_seconds)
+        return base.astimezone(UTC), frozen_end or now, first_run
 
     async def collect(
         self,
@@ -293,9 +343,10 @@ class VkCollector:
         proxy_url: str,
     ) -> CollectionResult:
         state = source.state
-        bootstrap = not state or not state.bootstrap_completed
+        window_start, window_end, first_run = self._window(source)
         post_cursor = dict(state.post_cursor or {}) if state else {}
-        start_offset = max(0, int(post_cursor.get("offset") or 0) - self.settings.vk_page_size)
+        offset = max(0, int(post_cursor.get("offset") or 0))
+        candidate_watermark = int(post_cursor.get("candidate_watermark") or 0)
         known_recent = set(state.recent_post_keys or []) if state else set()
         old_watermark = int(state.post_watermark or 0) if state and str(state.post_watermark).isdigit() else 0
 
@@ -306,10 +357,8 @@ class VkCollector:
             normalized_link = f"https://vk.com/{screen_name}" if screen_name else source.normalized_link
 
             items: list[CollectedItem] = []
-            normal_posts: list[dict[str, Any]] = []
-            pinned_posts: dict[str, dict[str, Any]] = {}
-            offset = start_offset
-            found_barrier = bootstrap or old_watermark == 0
+            selected_posts: dict[str, dict[str, Any]] = {}
+            found_barrier = False
             pages = 0
 
             while pages < self.settings.vk_max_pages_per_run:
@@ -331,34 +380,51 @@ class VkCollector:
                     found_barrier = True
                     break
                 pages += 1
+                stop_page = False
                 for post in page:
                     post_owner = int(post.get("owner_id") or owner_id)
                     post_id = int(post.get("id") or 0)
                     if not post_id:
                         continue
                     key = f"vk:post:{post_owner}:{post_id}"
-                    if int(post.get("is_pinned") or 0) == 1:
-                        pinned_posts[key] = post
+                    published = (
+                        datetime.fromtimestamp(int(post.get("date") or 0), tz=UTC)
+                        if post.get("date")
+                        else None
+                    )
+                    is_pinned = int(post.get("is_pinned") or 0) == 1
+                    if published and published <= window_end:
+                        candidate_watermark = max(candidate_watermark, post_id)
+
+                    # An old pinned post is not a barrier and is never a new event.
+                    if is_pinned:
+                        if published and window_start < published <= window_end and key not in known_recent:
+                            selected_posts[key] = post
                         continue
-                    if key in known_recent or (old_watermark and post_id <= old_watermark):
+
+                    if old_watermark and (key in known_recent or post_id <= old_watermark):
                         found_barrier = True
+                        stop_page = True
                         break
-                    normal_posts.append(post)
-                if found_barrier:
+                    if published and published <= window_start:
+                        found_barrier = True
+                        stop_page = True
+                        break
+                    if published and published <= window_end:
+                        selected_posts[key] = post
+
+                if stop_page:
                     break
                 if len(page) < self.settings.vk_page_size:
                     found_barrier = True
                     break
                 offset += self.settings.vk_page_size
 
-            selected_posts = normal_posts + list(pinned_posts.values())
             max_post_id = old_watermark
             new_post_keys: list[str] = []
-            for post in sorted(selected_posts, key=lambda p: int(p.get("date") or 0)):
+            for post in sorted(selected_posts.values(), key=lambda row: int(row.get("date") or 0)):
                 post_owner = int(post.get("owner_id") or owner_id)
                 post_id = int(post.get("id") or 0)
-                if not post_id:
-                    continue
                 key = f"vk:post:{post_owner}:{post_id}"
                 max_post_id = max(max_post_id, post_id)
                 new_post_keys.append(key)
@@ -370,7 +436,7 @@ class VkCollector:
                     attachments.extend(original.get("attachments") or [])
                     repost_text = clean_text(original.get("text"))
                 media = self._media_from_attachments(attachments)
-                published = datetime.fromtimestamp(int(post.get("date") or 0), tz=timezone.utc) if post.get("date") else None
+                published = datetime.fromtimestamp(int(post.get("date") or 0), tz=UTC)
                 post_text = clean_text(post.get("text"))
                 if repost_text:
                     post_text = f"{post_text}\n\n{repost_text}".strip()
@@ -389,7 +455,16 @@ class VkCollector:
                 await self._download_images(session, request_proxy, key, media)
                 items.append(item)
 
-            # VK stories are active-only; deduplication in PostgreSQL prevents repeats.
+            if found_barrier:
+                max_post_id = max(max_post_id, candidate_watermark)
+                next_post_cursor: dict[str, Any] = {}
+            else:
+                next_post_cursor = {
+                    "offset": offset,
+                    "candidate_watermark": candidate_watermark,
+                    "window_end": window_end.isoformat(),
+                }
+
             story_access_attempts = int((state.story_cursor or {}).get("access_attempts", 0)) if state else 0
             story_needs_retry = False
             story_cursor: dict[str, Any] = {}
@@ -403,8 +478,6 @@ class VkCollector:
                         {"owner_id": owner_id, "extended": 1},
                     )
                 except NotFoundError:
-                    # Some VK API combinations reject owner_id for stories.get.
-                    # Fall back to the current account feed and filter by owner.
                     data = await self._call(
                         session,
                         request_proxy,
@@ -424,30 +497,43 @@ class VkCollector:
                 story_cursor = {"access_attempts": story_access_attempts, "last_status": "access_denied"}
             except (NotFoundError, FeatureUnavailableError):
                 raw_stories = []
+
             story_keys: list[str] = []
+            known_story_keys = set(state.recent_story_keys or []) if state else set()
             max_story_id = int(state.story_watermark or 0) if state and str(state.story_watermark).isdigit() else 0
             for story in raw_stories:
                 story_owner = int(story.get("owner_id") or owner_id)
                 story_id = int(story.get("id") or 0)
                 if not story_id:
                     continue
-                key = f"vk:story:{story_owner}:{story_id}"
-                story_keys.append(key)
                 max_story_id = max(max_story_id, story_id)
-                media: list[MediaPayload] = []
+                key = f"vk:story:{story_owner}:{story_id}"
+                if key in known_story_keys:
+                    continue
+                published = (
+                    datetime.fromtimestamp(int(story.get("date") or 0), tz=UTC)
+                    if story.get("date")
+                    else None
+                )
+                if not published or not (window_start < published <= window_end):
+                    continue
+                story_keys.append(key)
+                story_media: list[MediaPayload] = []
                 if isinstance(story.get("photo"), dict):
-                    url, width, height = self._largest_photo(story["photo"])
-                    media.append(MediaPayload("photo", remote_url=url, width=width, height=height))
+                    url, width, height = self._best_photo(story["photo"])
+                    if url:
+                        story_media.append(MediaPayload("photo", preview_url=url, width=width, height=height))
                 elif isinstance(story.get("video"), dict):
                     video = story["video"]
-                    images = video.get("image") or video.get("first_frame") or []
-                    best = max(
-                        (x for x in images if isinstance(x, dict) and x.get("url")),
-                        key=lambda x: int(x.get("width") or 0) * int(x.get("height") or 0),
-                        default={},
-                    )
-                    media.append(MediaPayload("video_preview", preview_url=str(best.get("url") or "")))
-                published = datetime.fromtimestamp(int(story.get("date") or 0), tz=timezone.utc) if story.get("date") else None
+                    best = self._best_image(video.get("image") or video.get("first_frame") or [])
+                    if best.get("url"):
+                        story_media.append(
+                            MediaPayload(
+                                "video_preview",
+                                preview_url=str(best.get("url") or ""),
+                                metadata={"preview_only": True},
+                            )
+                        )
                 item = CollectedItem(
                     platform=Platform.VK,
                     item_type=ItemType.STORY,
@@ -456,30 +542,32 @@ class VkCollector:
                     original_url=f"https://vk.com/story{story_owner}_{story_id}",
                     text=clean_text(story.get("text") or story.get("caption")),
                     published_at=published,
-                    media=media,
+                    media=story_media,
                     raw=story,
                 )
-                await self._download_images(session, request_proxy, key, media)
+                await self._download_images(session, request_proxy, key, story_media)
                 items.append(item)
 
         needs_retry = (not found_barrier) or story_needs_retry
-        cursor = {"offset": offset + self.settings.vk_page_size} if not found_barrier else {}
         return CollectionResult(
             title=title,
             external_id=str(owner_id),
             normalized_link=normalized_link,
             items=items,
-            post_watermark=str(max_post_id if found_barrier else old_watermark),
+            post_watermark=str(max_post_id),
             story_watermark=str(max_story_id),
-            post_cursor=cursor,
+            post_cursor=next_post_cursor,
             story_cursor=story_cursor,
+            window_start=window_start,
+            window_end=window_end,
             needs_immediate_retry=needs_retry,
             diagnostics={
                 "owner_type": owner_type,
                 "pages": pages,
-                "start_offset": start_offset,
                 "found_barrier": found_barrier,
-                "bootstrap": bootstrap,
+                "first_run": first_run,
+                "window_start": window_start.isoformat(),
+                "window_end": window_end.isoformat(),
                 "post_keys": new_post_keys[-20:],
                 "story_keys": story_keys[-20:],
                 "story_needs_retry": story_needs_retry,

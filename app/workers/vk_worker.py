@@ -27,7 +27,7 @@ from app.db.repositories import (
 )
 from app.db.session import SessionFactory
 from app.security import SecretBox
-from app.workers.common import persist_collection_result
+from app.workers.common import keep_job_lease, persist_collection_result
 
 logger = structlog.get_logger()
 
@@ -59,9 +59,9 @@ class RotatingPool:
                 if entry_id not in self._in_use:
                     self._queue.put_nowait(entry)
 
-    async def acquire(self, timeout: float = 5.0) -> PoolEntry | None:
+    async def acquire(self, wait_seconds: float = 5.0) -> PoolEntry | None:
         try:
-            entry = await asyncio.wait_for(self._queue.get(), timeout=timeout)
+            entry = await asyncio.wait_for(self._queue.get(), timeout=wait_seconds)
         except TimeoutError:
             return None
         async with self._lock:
@@ -142,29 +142,34 @@ class VkWorker:
                         await asyncio.sleep(0.5)
                         continue
 
-                result = await self.collector.collect(
-                    source,
-                    token=credential.value,
-                    proxy_url=proxy.value,
-                )
-                async with SessionFactory() as session:
-                    async with session.begin():
-                        source = await SourceRepository.get(session, source.id)
-                        if not source:
-                            await JobRepository.complete(session, job_id)
-                            continue
-                        inserted, deliveries = await persist_collection_result(session, source, result)
-                        await CredentialRepository.mark_success(session, credential.id)
-                        await ProxyRepository.mark_success(session, proxy.id)
-                        if result.needs_immediate_retry:
-                            await JobRepository.retry(
-                                session,
-                                job_id,
-                                "continuing catch-up pagination",
-                                delay_seconds=1,
-                            )
-                        else:
-                            await JobRepository.complete(session, job_id)
+                async with keep_job_lease(
+                    job_id,
+                    worker_id,
+                    self.settings.job_lease_seconds,
+                ):
+                    result = await self.collector.collect(
+                        source,
+                        token=credential.value,
+                        proxy_url=proxy.value,
+                    )
+                    async with SessionFactory() as session:
+                        async with session.begin():
+                            source = await SourceRepository.get(session, source.id)
+                            if not source:
+                                await JobRepository.complete(session, job_id)
+                                continue
+                            inserted, deliveries = await persist_collection_result(session, source, result)
+                            await CredentialRepository.mark_success(session, credential.id)
+                            await ProxyRepository.mark_success(session, proxy.id)
+                            if result.needs_immediate_retry:
+                                await JobRepository.retry(
+                                    session,
+                                    job_id,
+                                    "continuing bounded VK scan",
+                                    delay_seconds=1,
+                                )
+                            else:
+                                await JobRepository.complete(session, job_id)
                 logger.info(
                     "vk_job_done",
                     job_id=job_id,
