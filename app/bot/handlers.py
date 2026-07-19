@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import io
 import math
 import secrets
+import shutil
 import tempfile
 from dataclasses import asdict
 from datetime import UTC, datetime, timedelta
@@ -17,6 +19,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.types import (
     BufferedInputFile,
     CallbackQuery,
+    Document,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     Message,
@@ -24,6 +27,7 @@ from aiogram.types import (
 from sqlalchemy import func, select
 
 from app.bot.keyboards import (
+    MAIN_MENU_TEXT,
     access_menu,
     accounts_menu,
     add_source_menu,
@@ -50,20 +54,47 @@ from app.services.credential_manager import CredentialManager
 from app.services.importer import errors_csv, parse_source_file
 from app.services.proxy_manager import ProxyManager
 from app.utils.links import normalize_source_link
+from app.utils.platforms import platform_badge
 from app.utils.regions import federal_district_for, normalize_region
 from app.utils.text import h
 
 router = Router(name="main")
 
 
+def _user_id(event: Message | CallbackQuery) -> int:
+    user = event.from_user
+    if user is None:
+        raise RuntimeError("Telegram event has no sender")
+    return user.id
+
+
+def _callback_data(callback: CallbackQuery) -> str:
+    if callback.data is None:
+        raise RuntimeError("Callback query has no data")
+    return callback.data
+
+
+def _document(message: Message) -> Document:
+    document = message.document
+    if document is None:
+        raise RuntimeError("Message has no document")
+    return document
+
+
+def _remove_tree(path: Path) -> None:
+    shutil.rmtree(path, ignore_errors=True)
+
+
 async def edit_or_answer(event: CallbackQuery, text: str, markup=None) -> None:
-    if event.message:
-        try:
-            await event.message.edit_text(text, reply_markup=markup)
-            return
-        except TelegramBadRequest:
-            pass
-        await event.message.answer(text, reply_markup=markup)
+    message = event.message
+    if not isinstance(message, Message):
+        return
+    try:
+        await message.edit_text(text, reply_markup=markup)
+        return
+    except TelegramBadRequest:
+        pass
+    await message.answer(text, reply_markup=markup)
 
 
 def is_admin(user_id: int, settings: Settings) -> bool:
@@ -74,18 +105,12 @@ async def clear_state_files(state: FSMContext) -> None:
     data = await state.get_data()
     preview_path = data.get("preview_path")
     if preview_path:
-        path = Path(preview_path)
-        try:
-            for child in path.parent.iterdir():
-                child.unlink(missing_ok=True)
-            path.parent.rmdir()
-        except OSError:
-            pass
+        await asyncio.to_thread(_remove_tree, Path(preview_path).parent)
     await state.clear()
 
 
 async def show_main(event: Message | CallbackQuery, settings: Settings) -> None:
-    user_id = event.from_user.id
+    user_id = _user_id(event)
     text = "<b>Мониторинг источников</b>\n\nОбщий пул VK и Telegram."
     markup = main_menu(is_admin(user_id, settings))
     if isinstance(event, CallbackQuery):
@@ -101,7 +126,7 @@ async def start(message: Message, state: FSMContext, settings: Settings) -> None
     args = (message.text or "").split(maxsplit=1)
     payload = args[1] if len(args) > 1 else ""
     if payload.startswith("bind_") and message.chat.type in {"group", "supergroup", "channel"}:
-        if not is_admin(message.from_user.id, settings):
+        if not is_admin(_user_id(message), settings):
             await message.answer("Подключить сигнальный чат может только администратор.")
             return
         token = payload.removeprefix("bind_")
@@ -115,13 +140,20 @@ async def start(message: Message, state: FSMContext, settings: Settings) -> None
                 await SettingsRepository.set(session, "signal_bind_token", "")
                 await AuditRepository.write(
                     session,
-                    message.from_user.id,
+                    _user_id(message),
                     "signal_chat_bound",
                     "chat",
                     str(message.chat.id),
                 )
         await message.answer("✅ Этот чат подключён для сигналов.")
         return
+    await show_main(message, settings)
+
+
+@router.message(F.text == MAIN_MENU_TEXT)
+async def main_menu_button(message: Message, state: FSMContext, settings: Settings) -> None:
+    """Always escape the current dialog and return to the root menu."""
+    await clear_state_files(state)
     await show_main(message, settings)
 
 
@@ -217,8 +249,9 @@ async def source_receive_region(message: Message, state: FSMContext) -> None:
 
 @router.callback_query(F.data == "source:region:skip")
 async def source_skip_region(callback: CallbackQuery, state: FSMContext) -> None:
-    if callback.message:
-        await _source_confirm(callback.message, state, "")
+    message = callback.message
+    if isinstance(message, Message):
+        await _source_confirm(message, state, "")
     await callback.answer()
 
 
@@ -237,11 +270,11 @@ async def source_confirm_add(callback: CallbackQuery, state: FSMContext, setting
                 federal_district=data.get("federal_district", ""),
                 category=data.get("category", ""),
                 subcategory=data.get("subcategory", ""),
-                added_by=callback.from_user.id,
+                added_by=_user_id(callback),
             )
             await AuditRepository.write(
                 session,
-                callback.from_user.id,
+                _user_id(callback),
                 "source_added" if created else "source_updated",
                 "source",
                 str(source.id),
@@ -250,7 +283,7 @@ async def source_confirm_add(callback: CallbackQuery, state: FSMContext, setting
     await edit_or_answer(
         callback,
         "✅ Источник добавлен." if created else "Источник уже был в пуле; данные обновлены.",
-        main_menu(is_admin(callback.from_user.id, settings)),
+        main_menu(is_admin(_user_id(callback), settings)),
     )
     await callback.answer()
 
@@ -268,28 +301,29 @@ async def source_add_file(callback: CallbackQuery, state: FSMContext) -> None:
 
 @router.message(AddSourceState.waiting_file, F.document)
 async def source_receive_file(message: Message, state: FSMContext, bot: Bot) -> None:
-    suffix = Path(message.document.file_name or "upload").suffix.lower()
+    document = _document(message)
+    suffix = Path(document.file_name or "upload").suffix.lower()
     if suffix not in {".xlsx", ".csv", ".tsv", ".txt"}:
         await message.answer("Поддерживаются XLSX, CSV, TSV и TXT.")
         return
     temp_dir = Path(tempfile.mkdtemp(prefix="social-import-"))
     path = temp_dir / f"input{suffix}"
-    await bot.download(message.document, destination=path)
+    await bot.download(document, destination=path)
     try:
-        preview = parse_source_file(path)
+        preview = await asyncio.to_thread(parse_source_file, path)
     except Exception as exc:
+        await asyncio.to_thread(_remove_tree, temp_dir)
         await message.answer(f"Ошибка чтения файла: {h(exc)}")
         return
     preview_path = temp_dir / "preview.json"
-    preview_path.write_bytes(
-        orjson.dumps({
-            "input_rows": preview.input_rows,
-            "candidates": [
-                {**asdict(c), "platform": c.platform.value} for c in preview.candidates
-            ],
-            "errors": [asdict(e) for e in preview.errors],
-        })
-    )
+    preview_bytes = orjson.dumps({
+        "input_rows": preview.input_rows,
+        "candidates": [
+            {**asdict(c), "platform": c.platform.value} for c in preview.candidates
+        ],
+        "errors": [asdict(e) for e in preview.errors],
+    })
+    await asyncio.to_thread(preview_path.write_bytes, preview_bytes)
     await state.update_data(preview_path=str(preview_path))
     await state.set_state(AddSourceState.confirm_file)
     if preview.errors:
@@ -313,7 +347,7 @@ async def source_receive_file(message: Message, state: FSMContext, bot: Bot) -> 
 async def source_file_confirm(callback: CallbackQuery, state: FSMContext, settings: Settings) -> None:
     data = await state.get_data()
     preview_path = Path(data["preview_path"])
-    payload = orjson.loads(preview_path.read_bytes())
+    payload = orjson.loads(await asyncio.to_thread(preview_path.read_bytes))
     created = updated = 0
     async with SessionFactory() as session:
         async with session.begin():
@@ -331,25 +365,20 @@ async def source_file_confirm(callback: CallbackQuery, state: FSMContext, settin
             created, updated = await SourceRepository.bulk_add(
                 session,
                 bulk_rows,
-                added_by=callback.from_user.id,
+                added_by=_user_id(callback),
             )
             await AuditRepository.write(
                 session,
-                callback.from_user.id,
+                _user_id(callback),
                 "sources_imported",
                 payload={"created": created, "updated": updated},
             )
-    try:
-        for child in preview_path.parent.iterdir():
-            child.unlink(missing_ok=True)
-        preview_path.parent.rmdir()
-    except OSError:
-        pass
+    await asyncio.to_thread(_remove_tree, preview_path.parent)
     await state.clear()
     await edit_or_answer(
         callback,
         f"✅ Импорт завершён.\n\nДобавлено: {created}\nУже существовало/обновлено: {updated}",
-        main_menu(is_admin(callback.from_user.id, settings)),
+        main_menu(is_admin(_user_id(callback), settings)),
     )
     await callback.answer()
 
@@ -358,7 +387,7 @@ SOURCE_PAGE_SIZE = 8
 
 
 def _location_token(value: str) -> str:
-    return hashlib.sha1(value.encode("utf-8")).hexdigest()[:10]
+    return hashlib.blake2s(value.encode("utf-8"), digest_size=5).hexdigest()
 
 
 def _display_location(value: str, empty: str) -> str:
@@ -435,9 +464,9 @@ async def _source_list_payload(
     rows: list[list[tuple[str, str]]] = []
     for source in sources:
         code = return_code_prefix.format(page=page)
-        icon = "🟦" if source.platform == Platform.VK else "✈️"
+        badge = platform_badge(source.platform)
         rows.append([(
-            f"{icon} · {_source_button_text(source)}",
+            f"{badge} · {_source_button_text(source)}",
             f"source:view:{source.id}:{code}",
         )])
     nav: list[tuple[str, str]] = []
@@ -473,8 +502,8 @@ async def source_menu(callback: CallbackQuery, state: FSMContext) -> None:
         kb([
             [("🔎 Поиск", "source:search")],
             [("🗂 Категории", "source:districts:1")],
-            [(f"VK · алфавит ({vk_count})", "source:alpha:vk:1")],
-            [(f"Telegram · алфавит ({tg_count})", "source:alpha:telegram:1")],
+            [(f"🟢 VK · алфавит ({vk_count})", "source:alpha:vk:1")],
+            [(f"🔵 TG · алфавит ({tg_count})", "source:alpha:telegram:1")],
             [("Назад", "menu:main")],
         ]),
     )
@@ -490,7 +519,7 @@ async def source_list_legacy(callback: CallbackQuery, state: FSMContext) -> None
 
 @router.callback_query(F.data.startswith("source:alpha:"))
 async def source_alpha(callback: CallbackQuery) -> None:
-    _, _, platform_value, page_value = callback.data.split(":")
+    _, _, platform_value, page_value = _callback_data(callback).split(":")
     platform = Platform(platform_value)
     page = int(page_value)
     short = "av" if platform == Platform.VK else "at"
@@ -507,7 +536,7 @@ async def source_alpha(callback: CallbackQuery) -> None:
 
 @router.callback_query(F.data.startswith("source:districts:"))
 async def source_districts(callback: CallbackQuery) -> None:
-    page = int(callback.data.rsplit(":", 1)[-1])
+    page = int(_callback_data(callback).rsplit(":", 1)[-1])
     async with SessionFactory() as session:
         districts = await SourceRepository.category_counts(session)
     pages = max(1, math.ceil(len(districts) / SOURCE_PAGE_SIZE))
@@ -533,7 +562,7 @@ async def source_districts(callback: CallbackQuery) -> None:
 
 @router.callback_query(F.data.startswith("source:regions:"))
 async def source_regions(callback: CallbackQuery) -> None:
-    _, _, district_token, page_value = callback.data.split(":")
+    _, _, district_token, page_value = _callback_data(callback).split(":")
     page = int(page_value)
     async with SessionFactory() as session:
         district = await _resolve_district(session, district_token)
@@ -568,7 +597,7 @@ async def source_regions(callback: CallbackQuery) -> None:
 
 @router.callback_query(F.data.startswith("source:regionitems:"))
 async def source_region_items(callback: CallbackQuery) -> None:
-    _, _, district_token, region_token, page_value = callback.data.split(":")
+    _, _, district_token, region_token, page_value = _callback_data(callback).split(":")
     page = int(page_value)
     async with SessionFactory() as session:
         district = await _resolve_district(session, district_token)
@@ -642,7 +671,7 @@ async def source_search_query(message: Message, state: FSMContext) -> None:
 
 @router.callback_query(F.data.startswith("source:search:page:"))
 async def source_search_page(callback: CallbackQuery, state: FSMContext) -> None:
-    page = int(callback.data.rsplit(":", 1)[-1])
+    page = int(_callback_data(callback).rsplit(":", 1)[-1])
     data = await state.get_data()
     query = str(data.get("source_search_query") or "").strip()
     if not query:
@@ -664,7 +693,7 @@ async def source_search_page(callback: CallbackQuery, state: FSMContext) -> None
 
 @router.callback_query(F.data.startswith("source:view:"))
 async def source_view(callback: CallbackQuery) -> None:
-    _, _, source_id, return_code = callback.data.split(":", 3)
+    _, _, source_id, return_code = _callback_data(callback).split(":", 3)
     async with SessionFactory() as session:
         source = await SourceRepository.get(session, int(source_id))
     if not source:
@@ -681,7 +710,7 @@ async def source_view(callback: CallbackQuery) -> None:
         f"<b>{h(source.title or source.normalized_link)}</b>\n"
         f"ID: <code>{source.id}</code>\n"
         f"Внешний ID: <code>{h(source.external_id or 'не определён')}</code>\n"
-        f"{source.platform.value.upper()}\n"
+        f"{platform_badge(source.platform)}\n"
         f"{h(location)}\n\n"
         f"{h(source.normalized_link)}\n"
         f"Статус: {status}\n"
@@ -703,29 +732,29 @@ async def source_view(callback: CallbackQuery) -> None:
 
 @router.callback_query(F.data.startswith("source:pause:"))
 async def source_pause(callback: CallbackQuery) -> None:
-    _, _, source_id, return_code = callback.data.split(":", 3)
+    _, _, source_id, return_code = _callback_data(callback).split(":", 3)
     async with SessionFactory() as session:
         async with session.begin():
             await SourceRepository.set_status(session, int(source_id), SourceStatus.PAUSED)
-            await AuditRepository.write(session, callback.from_user.id, "source_paused", "source", source_id)
+            await AuditRepository.write(session, _user_id(callback), "source_paused", "source", source_id)
     callback.data = f"source:view:{source_id}:{return_code}"
     await source_view(callback)
 
 
 @router.callback_query(F.data.startswith("source:resume:"))
 async def source_resume(callback: CallbackQuery) -> None:
-    _, _, source_id, return_code = callback.data.split(":", 3)
+    _, _, source_id, return_code = _callback_data(callback).split(":", 3)
     async with SessionFactory() as session:
         async with session.begin():
             await SourceRepository.set_status(session, int(source_id), SourceStatus.ACTIVE)
-            await AuditRepository.write(session, callback.from_user.id, "source_resumed", "source", source_id)
+            await AuditRepository.write(session, _user_id(callback), "source_resumed", "source", source_id)
     callback.data = f"source:view:{source_id}:{return_code}"
     await source_view(callback)
 
 
 @router.callback_query(F.data.startswith("source:delete:ask:"))
 async def source_delete_ask(callback: CallbackQuery) -> None:
-    _, _, _, source_id, return_code = callback.data.split(":", 4)
+    _, _, _, source_id, return_code = _callback_data(callback).split(":", 4)
     await edit_or_answer(
         callback,
         "Удалить источник из общего пула? История дедупликации сохранится.",
@@ -739,11 +768,11 @@ async def source_delete_ask(callback: CallbackQuery) -> None:
 
 @router.callback_query(F.data.startswith("source:delete:yes:"))
 async def source_delete_yes(callback: CallbackQuery) -> None:
-    _, _, _, source_id, return_code = callback.data.split(":", 4)
+    _, _, _, source_id, return_code = _callback_data(callback).split(":", 4)
     async with SessionFactory() as session:
         async with session.begin():
             await SourceRepository.set_status(session, int(source_id), SourceStatus.DELETED)
-            await AuditRepository.write(session, callback.from_user.id, "source_deleted", "source", source_id)
+            await AuditRepository.write(session, _user_id(callback), "source_deleted", "source", source_id)
     await edit_or_answer(
         callback,
         "✅ Источник удалён.",
@@ -754,7 +783,7 @@ async def source_delete_yes(callback: CallbackQuery) -> None:
 
 @router.callback_query(F.data.startswith("source:region:"))
 async def source_region_edit(callback: CallbackQuery, state: FSMContext) -> None:
-    source_id = int(callback.data.rsplit(":", 1)[-1])
+    source_id = int(_callback_data(callback).rsplit(":", 1)[-1])
     await state.set_state(EditRegionState.waiting_region)
     await state.update_data(source_id=source_id)
     await edit_or_answer(
@@ -780,7 +809,7 @@ async def source_region_save(message: Message, state: FSMContext) -> None:
             )
             await AuditRepository.write(
                 session,
-                message.from_user.id,
+                _user_id(message),
                 "source_category_changed",
                 "source",
                 str(data["source_id"]),
@@ -800,7 +829,7 @@ async def noop(callback: CallbackQuery) -> None:
 
 @router.callback_query(F.data == "admin:menu")
 async def admin_open(callback: CallbackQuery, settings: Settings) -> None:
-    if not is_admin(callback.from_user.id, settings):
+    if not is_admin(_user_id(callback), settings):
         await callback.answer("Только для администратора", show_alert=True)
         return
     await edit_or_answer(callback, "<b>Управление</b>", admin_menu())
@@ -809,7 +838,7 @@ async def admin_open(callback: CallbackQuery, settings: Settings) -> None:
 
 @router.callback_query(F.data == "admin:interval")
 async def admin_interval(callback: CallbackQuery, settings: Settings) -> None:
-    if not is_admin(callback.from_user.id, settings):
+    if not is_admin(_user_id(callback), settings):
         return
     async with SessionFactory() as session:
         current = await SettingsRepository.get(session, "poll_interval_seconds", settings.default_poll_interval_seconds)
@@ -824,14 +853,14 @@ async def admin_interval(callback: CallbackQuery, settings: Settings) -> None:
 
 @router.callback_query(F.data.startswith("admin:interval:set:"))
 async def admin_interval_set(callback: CallbackQuery, settings: Settings) -> None:
-    value = int(callback.data.rsplit(":", 1)[-1])
+    value = int(_callback_data(callback).rsplit(":", 1)[-1])
     if value < settings.min_poll_interval_seconds:
         await callback.answer(f"Минимум {settings.min_poll_interval_seconds} секунд", show_alert=True)
         return
     async with SessionFactory() as session:
         async with session.begin():
             await SettingsRepository.set(session, "poll_interval_seconds", value)
-            await AuditRepository.write(session, callback.from_user.id, "poll_interval_changed", payload={"seconds": value})
+            await AuditRepository.write(session, _user_id(callback), "poll_interval_changed", payload={"seconds": value})
     await callback.answer("Сохранено")
     callback.data = "admin:interval"
     await admin_interval(callback, settings)
@@ -899,7 +928,7 @@ async def _proxy_input_text(message: Message, text: str, state: FSMContext, sett
         async with session.begin():
             await AuditRepository.write(
                 session,
-                message.from_user.id,
+                _user_id(message),
                 "vk_proxies_imported",
                 payload={"created": created, "updated": updated, "failed": len([r for r in results if not r.ok])},
             )
@@ -925,7 +954,7 @@ async def admin_proxy_text(message: Message, state: FSMContext, settings: Settin
 @router.message(AdminState.waiting_proxy_input, F.document)
 async def admin_proxy_file(message: Message, state: FSMContext, bot: Bot, settings: Settings) -> None:
     buffer = io.BytesIO()
-    await bot.download(message.document, destination=buffer)
+    await bot.download(_document(message), destination=buffer)
     text = buffer.getvalue().decode("utf-8-sig", errors="replace")
     await _proxy_input_text(message, text, state, settings)
 
@@ -957,7 +986,7 @@ async def admin_accounts_vk_save(message: Message, state: FSMContext, settings: 
     created, updated = await CredentialManager(settings.app_encryption_key).save_vk(accounts)
     async with SessionFactory() as session:
         async with session.begin():
-            await AuditRepository.write(session, message.from_user.id, "vk_accounts_imported", payload={"created": created, "updated": updated, "errors": len(errors)})
+            await AuditRepository.write(session, _user_id(message), "vk_accounts_imported", payload={"created": created, "updated": updated, "errors": len(errors)})
     await state.clear()
     await message.answer(f"VK-токены: добавлено {created}, обновлено {updated}, ошибок {len(errors)}", reply_markup=accounts_menu())
 
@@ -965,12 +994,12 @@ async def admin_accounts_vk_save(message: Message, state: FSMContext, settings: 
 @router.message(AdminState.waiting_vk_accounts, F.document)
 async def admin_accounts_vk_file(message: Message, state: FSMContext, bot: Bot, settings: Settings) -> None:
     buffer = io.BytesIO()
-    await bot.download(message.document, destination=buffer)
+    await bot.download(_document(message), destination=buffer)
     accounts, errors = parse_vk_accounts(buffer.getvalue().decode("utf-8-sig", errors="replace"))
     created, updated = await CredentialManager(settings.app_encryption_key).save_vk(accounts)
     async with SessionFactory() as session:
         async with session.begin():
-            await AuditRepository.write(session, message.from_user.id, "vk_accounts_imported", payload={"created": created, "updated": updated, "errors": len(errors)})
+            await AuditRepository.write(session, _user_id(message), "vk_accounts_imported", payload={"created": created, "updated": updated, "errors": len(errors)})
     await state.clear()
     await message.answer(f"VK-токены: добавлено {created}, обновлено {updated}, ошибок {len(errors)}", reply_markup=accounts_menu())
 
@@ -988,7 +1017,7 @@ async def admin_accounts_tg_save(message: Message, state: FSMContext, settings: 
     created, updated = await CredentialManager(settings.app_encryption_key).save_tg(accounts)
     async with SessionFactory() as session:
         async with session.begin():
-            await AuditRepository.write(session, message.from_user.id, "tg_accounts_imported", payload={"created": created, "updated": updated, "errors": len(errors)})
+            await AuditRepository.write(session, _user_id(message), "tg_accounts_imported", payload={"created": created, "updated": updated, "errors": len(errors)})
     await state.clear()
     await message.answer(f"TG-сессии: добавлено {created}, обновлено {updated}, ошибок {len(errors)}", reply_markup=accounts_menu())
 
@@ -996,12 +1025,12 @@ async def admin_accounts_tg_save(message: Message, state: FSMContext, settings: 
 @router.message(AdminState.waiting_tg_accounts, F.document)
 async def admin_accounts_tg_file(message: Message, state: FSMContext, bot: Bot, settings: Settings) -> None:
     buffer = io.BytesIO()
-    await bot.download(message.document, destination=buffer)
+    await bot.download(_document(message), destination=buffer)
     accounts, errors = parse_tg_accounts(buffer.getvalue().decode("utf-8-sig", errors="replace"))
     created, updated = await CredentialManager(settings.app_encryption_key).save_tg(accounts)
     async with SessionFactory() as session:
         async with session.begin():
-            await AuditRepository.write(session, message.from_user.id, "tg_accounts_imported", payload={"created": created, "updated": updated, "errors": len(errors)})
+            await AuditRepository.write(session, _user_id(message), "tg_accounts_imported", payload={"created": created, "updated": updated, "errors": len(errors)})
     await state.clear()
     await message.answer(f"TG-сессии: добавлено {created}, обновлено {updated}, ошибок {len(errors)}", reply_markup=accounts_menu())
 
@@ -1060,14 +1089,14 @@ async def admin_access_list(callback: CallbackQuery, settings: Settings) -> None
 
 @router.callback_query(F.data.startswith("admin:access:disable:"))
 async def admin_access_disable(callback: CallbackQuery, settings: Settings) -> None:
-    user_id = int(callback.data.rsplit(":", 1)[-1])
+    user_id = int(_callback_data(callback).rsplit(":", 1)[-1])
     if user_id == settings.admin_telegram_id:
         await callback.answer("Администратора отключить нельзя", show_alert=True)
         return
     async with SessionFactory() as session:
         async with session.begin():
             await AccessRepository.disable_user(session, user_id)
-            await AuditRepository.write(session, callback.from_user.id, "user_disabled", "user", str(user_id))
+            await AuditRepository.write(session, _user_id(callback), "user_disabled", "user", str(user_id))
     callback.data = "admin:access:list"
     await admin_access_list(callback, settings)
 

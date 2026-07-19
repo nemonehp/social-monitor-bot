@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+from io import BytesIO
 from types import SimpleNamespace
 
 import pytest
+from PIL import Image
 
 from app.collectors.telegram import TelegramCollector
 from app.collectors.vk import VkCollector
@@ -94,7 +96,9 @@ async def test_telegram_video_downloads_thumbnail_only(tmp_path):
 
         async def download_media(self, media, *, file, thumb):
             self.calls.append((media, file, thumb))
-            return b"\xff\xd8\xffpreview"
+            buffer = BytesIO()
+            Image.new("RGB", (1920, 1080), "white").save(buffer, format="JPEG")
+            return buffer.getvalue()
 
     client = FakeClient()
     result = await collector._download_message_previews(client, "tg:test", [message])
@@ -102,7 +106,7 @@ async def test_telegram_video_downloads_thumbnail_only(tmp_path):
     assert len(result) == 1
     assert result[0].media_type == "video_preview"
     assert result[0].metadata["preview_only"] is True
-    assert client.calls == [(message, bytes, 0)]
+    assert client.calls == [(message, bytes, huge)]
 
 
 @pytest.mark.asyncio

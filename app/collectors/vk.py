@@ -6,7 +6,6 @@ import re
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
 
 import aiohttp
 
@@ -24,21 +23,39 @@ from app.collectors.types import CollectedItem, CollectionResult, MediaPayload
 from app.config import Settings
 from app.db.enums import ItemType, Platform
 from app.db.models import Source
+from app.services.image_preview import prepare_preview
 from app.services.network import proxy_session
 from app.utils.text import clean_text
 
-TOKEN_DEAD_CODES = {5, 17, 27, 28}
+TOKEN_DEAD_CODES = {5, 17, 27, 28, 1116}
 RETRY_CODES = {6, 9, 10, 14, 29}
 ACCESS_CODES = {15, 200, 201, 203}
 METHOD_UNAVAILABLE_CODES = {3, 7}
 NOT_FOUND_CODES = {18, 30, 100, 113}
 
 
+def _write_preview(path: Path, data: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(data)
+
+
+def _redact_vk_secret(value: str, token: str = "") -> str:
+    sanitized = value.replace(token, "<redacted>") if token else value
+    return re.sub(
+        r"(?i)(\b(?:access[_ -]?|anonymous\s+)?token(?:\s+|=|:)+)[^\s,;]+",
+        r"\1<redacted>",
+        sanitized,
+    )
+
+
 class VkApiError(RuntimeError):
-    def __init__(self, error: dict[str, Any]):
+    def __init__(self, error: dict[str, Any], token: str = ""):
         self.error = error
         self.code = int(error.get("error_code") or 0)
-        self.message = str(error.get("error_msg") or error)
+        message = str(error.get("error_msg") or error)
+        # Some VK errors echo the rejected access token in plain text. Never
+        # persist or log that credential, even when the surrounding wording changes.
+        self.message = _redact_vk_secret(message, token)
         super().__init__(f"VK {self.code}: {self.message}")
 
 
@@ -80,8 +97,12 @@ class VkCollector:
                 if response.status >= 500:
                     raise RetryableCollectorError(f"VK HTTP {response.status}")
                 if response.status != 200:
-                    raise RetryableCollectorError(f"VK HTTP {response.status}: {text[:300]}")
+                    raise RetryableCollectorError(
+                        f"VK HTTP {response.status}: {_redact_vk_secret(text[:300], token)}"
+                    )
                 data = json.loads(text)
+                if not isinstance(data, dict):
+                    raise RetryableCollectorError("VK returned a non-object response")
         except ProxyUnavailableError:
             raise
         except (TimeoutError, aiohttp.ClientError) as exc:
@@ -89,7 +110,7 @@ class VkCollector:
         except json.JSONDecodeError as exc:
             raise RetryableCollectorError(str(exc)) from exc
         if "error" in data:
-            error = VkApiError(data["error"])
+            error = VkApiError(data["error"], token)
             if error.code in TOKEN_DEAD_CODES:
                 raise CredentialDeadError(str(error)) from error
             if error.code in RETRY_CODES:
@@ -192,34 +213,104 @@ class VkCollector:
         screen_name = str(group.get("screen_name") or screen_name)
         return owner_id, str(group.get("type") or owner_type), title, screen_name
 
-    def _best_photo(self, photo: dict[str, Any]) -> tuple[str, int | None, int | None]:
-        sizes = [x for x in (photo.get("sizes") or []) if isinstance(x, dict) and x.get("url")]
-        if sizes:
-            within = [
-                x for x in sizes
-                if max(int(x.get("width") or 0), int(x.get("height") or 0)) <= self.settings.media_max_image_edge
-            ]
-            candidates = within or sizes
-            best = max(
-                candidates,
-                key=lambda x: int(x.get("width") or 0) * int(x.get("height") or 0),
-            )
-            return str(best.get("url") or ""), best.get("width"), best.get("height")
-        url = str(photo.get("photo_807") or photo.get("photo_604") or photo.get("url") or "")
-        return url, None, None
-
-    def _best_image(self, images: Any) -> dict[str, Any]:
+    @staticmethod
+    def _ranked_images(images: Any) -> list[dict[str, Any]]:
         candidates = [x for x in (images or []) if isinstance(x, dict) and x.get("url")]
-        if not candidates:
-            return {}
-        within = [
-            x for x in candidates
-            if max(int(x.get("width") or 0), int(x.get("height") or 0)) <= self.settings.media_max_image_edge
-        ]
-        return max(
-            within or candidates,
-            key=lambda x: int(x.get("width") or 0) * int(x.get("height") or 0),
+        return sorted(
+            candidates,
+            key=lambda x: (
+                int(x.get("width") or 0) * int(x.get("height") or 0),
+                int(x.get("width") or 0),
+                int(x.get("height") or 0),
+            ),
+            reverse=True,
         )
+
+    @classmethod
+    def _photo_candidates(cls, photo: dict[str, Any]) -> list[dict[str, Any]]:
+        ranked = cls._ranked_images(photo.get("sizes") or [])
+        if ranked:
+            return ranked
+        result: list[dict[str, Any]] = []
+        for key in ("photo_2560", "photo_1280", "photo_807", "photo_604", "photo_130", "url"):
+            url = str(photo.get(key) or "")
+            if url and all(row.get("url") != url for row in result):
+                result.append({"url": url})
+        return result
+
+    @classmethod
+    def _best_photo(cls, photo: dict[str, Any]) -> tuple[str, int | None, int | None]:
+        candidates = cls._photo_candidates(photo)
+        if not candidates:
+            return "", None, None
+        best = candidates[0]
+        return str(best.get("url") or ""), best.get("width"), best.get("height")
+
+    @classmethod
+    def _best_image(cls, images: Any) -> dict[str, Any]:
+        candidates = cls._ranked_images(images)
+        return candidates[0] if candidates else {}
+
+    @staticmethod
+    def _candidate_urls(candidates: list[dict[str, Any]]) -> list[str]:
+        urls: list[str] = []
+        for candidate in candidates:
+            url = str(candidate.get("url") or "")
+            if url and url not in urls:
+                urls.append(url)
+        return urls
+
+    @staticmethod
+    def _merge_repost_text(comment: Any, original: Any) -> str:
+        comment_text = clean_text(comment)
+        original_text = clean_text(original)
+        if not original_text or original_text == comment_text:
+            return comment_text
+        return f"{comment_text}\n\n{original_text}".strip()
+
+    @staticmethod
+    def _attachment_key(attachment: Any) -> str:
+        if not isinstance(attachment, dict):
+            return ""
+        kind = str(attachment.get("type") or "unknown")
+        obj = attachment.get(kind) or {}
+        if not isinstance(obj, dict):
+            return ""
+        owner_id = obj.get("owner_id")
+        object_id = obj.get("id")
+        if owner_id is not None and object_id is not None:
+            return f"{kind}:{owner_id}:{object_id}"
+        if kind == "link" and obj.get("url"):
+            return f"link:{obj.get('url')}"
+        preview_urls: list[str] = []
+        if kind == "photo":
+            preview_urls = [str(row.get("url") or "") for row in obj.get("sizes") or [] if isinstance(row, dict)]
+        elif kind == "video":
+            preview_urls = [
+                str(row.get("url") or "")
+                for row in (obj.get("image") or obj.get("first_frame") or [])
+                if isinstance(row, dict)
+            ]
+        preview_url = next((url for url in preview_urls if url), "")
+        return f"{kind}:{preview_url}" if preview_url else ""
+
+    @classmethod
+    def _merge_attachments(cls, *groups: Any) -> list[dict[str, Any]]:
+        result: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for group in groups:
+            if not isinstance(group, list):
+                continue
+            for attachment in group:
+                if not isinstance(attachment, dict):
+                    continue
+                key = cls._attachment_key(attachment)
+                if key and key in seen:
+                    continue
+                if key:
+                    seen.add(key)
+                result.append(attachment)
+        return result
 
     def _media_from_attachments(self, attachments: Any) -> list[MediaPayload]:
         result: list[MediaPayload] = []
@@ -233,11 +324,22 @@ class VkCollector:
             kind = str(attachment.get("type") or "unknown")
             obj = attachment.get(kind) or {}
             if kind == "photo":
+                candidates = self._photo_candidates(obj)
                 url, width, height = self._best_photo(obj)
                 if url:
-                    result.append(MediaPayload("photo", preview_url=url, width=width, height=height))
+                    result.append(
+                        MediaPayload(
+                            "photo",
+                            preview_url=url,
+                            width=width,
+                            height=height,
+                            metadata={"preview_candidates": self._candidate_urls(candidates)},
+                        )
+                    )
             elif kind == "video":
-                best = self._best_image(obj.get("image") or obj.get("first_frame") or [])
+                images = obj.get("image") or obj.get("first_frame") or []
+                candidates = self._ranked_images(images)
+                best = candidates[0] if candidates else {}
                 owner_id = obj.get("owner_id")
                 video_id = obj.get("id")
                 video_url = (
@@ -253,11 +355,16 @@ class VkCollector:
                             preview_url=str(best.get("url") or ""),
                             width=best.get("width"),
                             height=best.get("height"),
-                            metadata={"preview_only": True},
+                            metadata={
+                                "preview_only": True,
+                                "preview_candidates": self._candidate_urls(candidates),
+                            },
                         )
                     )
             elif kind == "link":
-                url, width, height = self._best_photo(obj.get("photo") or {})
+                photo = obj.get("photo") or {}
+                candidates = self._photo_candidates(photo)
+                url, width, height = self._best_photo(photo)
                 if url:
                     result.append(
                         MediaPayload(
@@ -266,7 +373,10 @@ class VkCollector:
                             preview_url=url,
                             width=width,
                             height=height,
-                            metadata={"preview_only": True},
+                            metadata={
+                                "preview_only": True,
+                                "preview_candidates": self._candidate_urls(candidates),
+                            },
                         )
                     )
         return result
@@ -284,35 +394,55 @@ class VkCollector:
         for payload in media:
             if downloaded >= self.settings.media_max_previews_per_item:
                 break
-            url = payload.preview_url
-            if not url or not url.startswith(("http://", "https://")):
-                continue
-            try:
-                async with session.get(url, proxy=request_proxy) as response:
-                    if response.status != 200:
-                        continue
-                    declared = int(response.headers.get("Content-Length") or 0)
-                    if declared and declared > self.settings.media_max_preview_bytes:
-                        continue
-                    content = bytearray()
-                    async for chunk in response.content.iter_chunked(64 * 1024):
-                        content.extend(chunk)
-                        if len(content) > self.settings.media_max_preview_bytes:
-                            content.clear()
-                            break
-                    if not content:
-                        continue
-                    target_dir.mkdir(parents=True, exist_ok=True)
-                    suffix = Path(urlparse(url).path).suffix.lower()
-                    if suffix not in {".jpg", ".jpeg", ".png", ".webp"}:
-                        suffix = ".jpg"
-                    path = target_dir / f"{downloaded:02d}{suffix}"
-                    path.write_bytes(content)
-                    payload.local_path = str(path)
-                    payload.mime_type = response.headers.get("Content-Type", "image/jpeg").split(";", 1)[0]
-                    downloaded += 1
-            except Exception:
-                continue
+            configured = payload.metadata.get("preview_candidates") or []
+            urls = [payload.preview_url, *configured]
+            urls = list(
+                dict.fromkeys(
+                    str(url)
+                    for url in urls
+                    if str(url).startswith(("http://", "https://"))
+                )
+            )
+            for candidate_index, url in enumerate(urls):
+                try:
+                    async with session.get(url, proxy=request_proxy) as response:
+                        if response.status != 200:
+                            continue
+                        declared = int(response.headers.get("Content-Length") or 0)
+                        if declared and declared > self.settings.media_max_download_bytes:
+                            continue
+                        content = bytearray()
+                        async for chunk in response.content.iter_chunked(64 * 1024):
+                            content.extend(chunk)
+                            if len(content) > self.settings.media_max_download_bytes:
+                                content.clear()
+                                break
+                        if not content:
+                            continue
+                        prepared = await asyncio.to_thread(
+                            prepare_preview,
+                            bytes(content),
+                            max_edge=self.settings.media_max_image_edge,
+                            max_bytes=self.settings.media_max_preview_bytes,
+                            min_edge=getattr(self.settings, "media_min_preview_edge", 320),
+                        )
+                        if not prepared:
+                            continue
+                        path = target_dir / f"{downloaded:02d}.jpg"
+                        await asyncio.to_thread(_write_preview, path, prepared.data)
+                        payload.local_path = str(path)
+                        payload.mime_type = prepared.mime_type
+                        payload.width = prepared.width
+                        payload.height = prepared.height
+                        payload.metadata = {
+                            **payload.metadata,
+                            "source": "vk_ranked_image",
+                            "selected_candidate": candidate_index,
+                        }
+                        downloaded += 1
+                        break
+                except Exception:
+                    continue
 
     def _window(self, source: Source) -> tuple[datetime, datetime, bool]:
         state = source.state
@@ -456,18 +586,19 @@ class VkCollector:
                 key = f"vk:post:{post_owner}:{post_id}"
                 max_post_id = max(max_post_id, post_id)
                 new_post_keys.append(key)
-                attachments = list(post.get("attachments") or [])
                 copy_history = post.get("copy_history") or []
-                repost_text = ""
-                if isinstance(copy_history, list) and copy_history:
-                    original = copy_history[0] or {}
-                    attachments.extend(original.get("attachments") or [])
-                    repost_text = clean_text(original.get("text"))
+                original = copy_history[0] if isinstance(copy_history, list) and copy_history else {}
+                original = original if isinstance(original, dict) else {}
+                attachments = self._merge_attachments(
+                    post.get("attachments") or [],
+                    original.get("attachments") or [],
+                )
                 media = self._media_from_attachments(attachments)
                 published = datetime.fromtimestamp(int(post.get("date") or 0), tz=UTC)
-                post_text = clean_text(post.get("text"))
-                if repost_text:
-                    post_text = f"{post_text}\n\n{repost_text}".strip()
+                post_text = self._merge_repost_text(
+                    post.get("text"),
+                    original.get("text"),
+                )
                 item = CollectedItem(
                     platform=Platform.VK,
                     item_type=ItemType.POST,
@@ -548,18 +679,35 @@ class VkCollector:
                 story_keys.append(key)
                 story_media: list[MediaPayload] = []
                 if isinstance(story.get("photo"), dict):
-                    url, width, height = self._best_photo(story["photo"])
+                    photo = story["photo"]
+                    candidates = self._photo_candidates(photo)
+                    url, width, height = self._best_photo(photo)
                     if url:
-                        story_media.append(MediaPayload("photo", preview_url=url, width=width, height=height))
+                        story_media.append(
+                            MediaPayload(
+                                "photo",
+                                preview_url=url,
+                                width=width,
+                                height=height,
+                                metadata={"preview_candidates": self._candidate_urls(candidates)},
+                            )
+                        )
                 elif isinstance(story.get("video"), dict):
                     video = story["video"]
-                    best = self._best_image(video.get("image") or video.get("first_frame") or [])
+                    images = video.get("image") or video.get("first_frame") or []
+                    candidates = self._ranked_images(images)
+                    best = candidates[0] if candidates else {}
                     if best.get("url"):
                         story_media.append(
                             MediaPayload(
                                 "video_preview",
                                 preview_url=str(best.get("url") or ""),
-                                metadata={"preview_only": True},
+                                width=best.get("width"),
+                                height=best.get("height"),
+                                metadata={
+                                    "preview_only": True,
+                                    "preview_candidates": self._candidate_urls(candidates),
+                                },
                             )
                         )
                 item = CollectedItem(

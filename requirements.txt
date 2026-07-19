@@ -10,3 +10,4 @@ cryptography==45.0.7
 openpyxl==3.1.5
 orjson==3.11.3
 structlog==25.4.0
+Pillow==11.3.0

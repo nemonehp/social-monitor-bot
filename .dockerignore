@@ -9,3 +9,9 @@ __pycache__
 *.pyo
 *.log
 data/media/*
+tests/
+docs/
+requirements-dev.txt
+CHANGELOG.md
+README.md
+scripts/

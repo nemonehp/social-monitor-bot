@@ -1,6 +1,13 @@
 from __future__ import annotations
 
-from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+from aiogram.types import (
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    KeyboardButton,
+    ReplyKeyboardMarkup,
+)
+
+MAIN_MENU_TEXT = "Главное меню"
 
 
 def kb(rows: list[list[tuple[str, str]]]) -> InlineKeyboardMarkup:
@@ -9,6 +16,16 @@ def kb(rows: list[list[tuple[str, str]]]) -> InlineKeyboardMarkup:
             [InlineKeyboardButton(text=text, callback_data=data) for text, data in row]
             for row in rows
         ]
+    )
+
+
+def persistent_main_menu() -> ReplyKeyboardMarkup:
+    """Persistent bottom keyboard available in every private bot dialog state."""
+    return ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text=MAIN_MENU_TEXT)]],
+        resize_keyboard=True,
+        is_persistent=True,
+        input_field_placeholder="Выберите действие",
     )
 
 

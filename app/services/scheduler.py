@@ -35,6 +35,7 @@ from app.security import SecretBox
 from app.services.alerts import AlertService
 from app.services.media_cleanup import cleanup_delivered_media
 from app.services.network import check_direct_ip, check_proxy, check_vk_access
+from app.utils.platforms import platform_badge
 from app.utils.text import h
 
 logger = structlog.get_logger()
@@ -139,7 +140,7 @@ class Scheduler:
                         Delivery.updated_at < now - timedelta(days=self.settings.delivery_history_days),
                     )
                 )
-        return int(jobs.rowcount or 0), int(deliveries.rowcount or 0)
+        return int(getattr(jobs, "rowcount", 0) or 0), int(getattr(deliveries, "rowcount", 0) or 0)
 
     async def notify_dead_credentials(self) -> None:
         async with SessionFactory() as session:
@@ -357,8 +358,8 @@ class Scheduler:
             f"Постов: {tg_posts + vk_posts}",
             f"Историй: {tg_stories + vk_stories}",
             "",
-            f"✈️ Telegram: {tg_posts + tg_stories} · посты {tg_posts} · истории {tg_stories}",
-            f"🟦 VK: {vk_posts + vk_stories} · посты {vk_posts} · истории {vk_stories}",
+            f"{platform_badge(Platform.TELEGRAM)}: {tg_posts + tg_stories} · посты {tg_posts} · истории {tg_stories}",
+            f"{platform_badge(Platform.VK)}: {vk_posts + vk_stories} · посты {vk_posts} · истории {vk_stories}",
             f"Всего объектов в базе: {total_all}",
         ]
         if top_rows:

@@ -4,10 +4,10 @@ import asyncio
 import re
 from collections import OrderedDict
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Any
 
 from telethon import TelegramClient
-from telethon.utils import stripped_photo_to_jpg
 
 from app.collectors.errors import (
     AccessDeniedError,
@@ -21,6 +21,7 @@ from app.collectors.types import CollectedItem, CollectionResult, MediaPayload
 from app.config import Settings
 from app.db.enums import ItemType, Platform
 from app.db.models import Source
+from app.services.image_preview import PreparedPreview, prepare_preview
 from app.utils.text import clean_text
 
 BAD_SESSION_ERRORS = {
@@ -112,6 +113,11 @@ def _jsonable(value: Any, depth: int = 5) -> Any:
         except Exception:
             pass
     return clean_text(value)
+
+
+def _write_preview(path: Path, data: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(data)
 
 
 class TelegramCollector:
@@ -402,26 +408,45 @@ class TelegramCollector:
             },
         )
 
-    def _thumb_candidates(self, media: Any) -> list[tuple[int, Any]]:
+    @staticmethod
+    def _thumbnail_sizes(media: Any) -> list[Any]:
         inner = getattr(media, "photo", None) or getattr(media, "document", None) or media
-        sizes = list(getattr(inner, "sizes", None) or getattr(inner, "thumbs", None) or [])
+        return list(getattr(inner, "sizes", None) or getattr(inner, "thumbs", None) or [])
+
+    def _thumb_candidates(self, media: Any) -> list[Any]:
+        """Return downloadable image thumbnails from largest to smallest.
+
+        Telegram places tiny ``PhotoStrippedSize`` placeholders in the same list as
+        normal thumbnails. They are loading placeholders rather than usable final
+        previews, so they are excluded completely.
+        """
         ranked: list[tuple[int, int, int, Any]] = []
-        for index, size in enumerate(sizes):
+        for index, size in enumerate(self._thumbnail_sizes(media)):
+            name = type(size).__name__
+            if name in {"PhotoStrippedSize", "PhotoPathSize", "PhotoSizeEmpty"}:
+                continue
             width = int(getattr(size, "w", 0) or 0)
             height = int(getattr(size, "h", 0) or 0)
             area = width * height
-            edge = max(width, height)
-            within = 1 if edge and edge <= self.settings.media_max_image_edge else 0
-            ranked.append((within, area, index, size))
+            file_size = int(getattr(size, "size", 0) or 0)
+            ranked.append((area, file_size, index, size))
         ranked.sort(reverse=True, key=lambda row: (row[0], row[1], row[2]))
-        return [(index, size) for _within, _area, index, size in ranked]
+        return [size for _area, _file_size, _index, size in ranked]
 
-    @staticmethod
-    def _is_image_bytes(data: bytes) -> bool:
-        return (
-            data.startswith(b"\xff\xd8\xff")
-            or data.startswith(b"\x89PNG\r\n\x1a\n")
-            or (len(data) > 12 and data[8:12] == b"WEBP")
+    async def _prepare_preview(self, data: bytes) -> PreparedPreview | None:
+        max_download_bytes = getattr(
+            self.settings,
+            "media_max_download_bytes",
+            self.settings.media_max_preview_bytes,
+        )
+        if len(data) > max_download_bytes:
+            return None
+        return await asyncio.to_thread(
+            prepare_preview,
+            data,
+            max_edge=self.settings.media_max_image_edge,
+            max_bytes=self.settings.media_max_preview_bytes,
+            min_edge=getattr(self.settings, "media_min_preview_edge", 320),
         )
 
     async def _download_preview_bytes(
@@ -430,61 +455,94 @@ class TelegramCollector:
         media: Any,
         *,
         download_target: Any | None = None,
-    ) -> bytes | None:
+        allow_full_image: bool = False,
+    ) -> PreparedPreview | None:
         inner = getattr(media, "photo", None) or getattr(media, "document", None) or media
         is_photo = "Photo" in type(inner).__name__
-        candidates = self._thumb_candidates(inner)
-
-        # Stripped thumbnails are embedded in the API response and are the most
-        # reliable fallback for Telegram videos whose CDN thumb cannot be fetched.
-        for _index, size in candidates:
-            raw = getattr(size, "bytes", None)
-            if raw and type(size).__name__ == "PhotoStrippedSize":
-                try:
-                    data = bytes(stripped_photo_to_jpg(raw))
-                except Exception:
-                    continue
-                if len(data) <= self.settings.media_max_preview_bytes and self._is_image_bytes(data):
-                    return data
-
         target = download_target or media
-        thumb_indexes: list[int | None] = [index for index, _size in candidates]
-        if is_photo and not thumb_indexes:
-            thumb_indexes = [None]
-        # Try several known thumbnail sizes. Never call a document/video download
-        # without an explicit thumbnail, so full videos cannot reach the server.
-        for thumb in thumb_indexes:
-            if thumb is None and not is_photo:
+
+        # Newer Telegram video media may expose a dedicated still cover. Prefer it
+        # over the generic document thumbnail without downloading the video itself.
+        video_cover = getattr(media, "video_cover", None)
+        if video_cover is not None and video_cover is not media:
+            cover = await self._download_preview_bytes(client, video_cover)
+            if cover:
+                return cover
+
+        # Images sent as documents have only a low-resolution document thumbnail.
+        # Download the full payload only when it is explicitly an image and fits the
+        # strict download ceiling. Full videos/audio/documents are never requested.
+        declared_size = int(getattr(inner, "size", 0) or 0)
+        if allow_full_image and 0 < declared_size <= self.settings.media_max_download_bytes:
+            try:
+                raw = await client.download_media(target, file=bytes)
+            except Exception:
+                raw = None
+            if isinstance(raw, (bytes, bytearray)) and raw:
+                prepared = await self._prepare_preview(bytes(raw))
+                if prepared:
+                    return prepared
+
+        # Telethon supports passing a PhotoSize object directly. Try the largest
+        # normal image first, then progressively smaller ones. This avoids index
+        # ambiguity and follows the library's documented thumbnail semantics.
+        candidates = self._thumb_candidates(inner)
+        for candidate in candidates:
+            declared_size = int(getattr(candidate, "size", 0) or 0)
+            if declared_size and declared_size > self.settings.media_max_download_bytes:
                 continue
             try:
-                data = await client.download_media(target, file=bytes, thumb=thumb)
+                raw = await client.download_media(target, file=bytes, thumb=candidate)
             except Exception:
                 continue
-            if not isinstance(data, (bytes, bytearray)) or not data:
+            if not isinstance(raw, (bytes, bytearray)) or not raw:
                 continue
-            data = bytes(data)
-            if len(data) > self.settings.media_max_preview_bytes:
-                continue
-            if self._is_image_bytes(data):
-                return data
+            prepared = await self._prepare_preview(bytes(raw))
+            if prepared:
+                return prepared
+
+        # Some photos expose no explicit normal sizes through lightweight adapters.
+        # ``thumb=-1`` asks Telethon for the largest available thumbnail.
+        if is_photo and not candidates:
+            try:
+                raw = await client.download_media(target, file=bytes, thumb=-1)
+            except Exception:
+                raw = None
+            if isinstance(raw, (bytes, bytearray)) and raw:
+                prepared = await self._prepare_preview(bytes(raw))
+                if prepared:
+                    return prepared
+
+        # ``PhotoStrippedSize`` is only a tiny blurred placeholder used while a
+        # real image loads. Sending it as the final preview produces visibly poor
+        # notifications, so an item without a normal thumbnail is sent text-only.
         return None
 
-    @staticmethod
-    def _message_media(message: Any) -> tuple[Any | None, str]:
-        if getattr(message, "photo", None) is not None:
-            return message.photo, "photo"
-        if getattr(message, "video", None) is not None:
-            return getattr(message, "document", None) or message.video, "video_preview"
-        if getattr(message, "document", None) is not None:
-            return message.document, "document_preview"
+    def _message_media(self, message: Any) -> tuple[Any | None, Any | None, str, bool]:
         media = getattr(message, "media", None)
+        if getattr(message, "photo", None) is not None:
+            return message.photo, message, "photo", False
+        if getattr(message, "video", None) is not None:
+            video_cover = getattr(media, "video_cover", None)
+            if video_cover is not None:
+                return video_cover, video_cover, "video_preview", False
+            document = getattr(message, "document", None) or message.video
+            return document, message, "video_preview", False
+        if getattr(message, "document", None) is not None:
+            document = message.document
+            mime_type = str(getattr(document, "mime_type", "") or "").lower()
+            if mime_type.startswith("image/"):
+                return document, message, "photo", True
+            return document, message, "document_preview", False
         webpage = getattr(media, "webpage", None)
         if webpage is not None:
             if getattr(webpage, "photo", None) is not None:
-                return webpage.photo, "link_preview"
+                return webpage.photo, message, "link_preview", False
             if getattr(webpage, "document", None) is not None:
-                return webpage.document, "document_preview"
-        return None, ""
+                document = webpage.document
+                mime_type = str(getattr(document, "mime_type", "") or "").lower()
+                return document, message, "link_preview", mime_type.startswith("image/")
+        return None, None, "", False
 
     async def _download_message_previews(
         self,
@@ -498,27 +556,30 @@ class TelegramCollector:
         for message in messages:
             if len(result) >= self.settings.media_max_previews_per_item:
                 break
-            media_obj, media_type = self._message_media(message)
+            media_obj, download_target, media_type, allow_full_image = self._message_media(message)
             if media_obj is None:
                 continue
-            data = await self._download_preview_bytes(
+            preview = await self._download_preview_bytes(
                 client,
                 media_obj,
-                download_target=message,
+                download_target=download_target,
+                allow_full_image=allow_full_image,
             )
-            if not data:
+            if not preview:
                 continue
-            target_dir.mkdir(parents=True, exist_ok=True)
             path = target_dir / f"{len(result):02d}.jpg"
-            path.write_bytes(data)
+            await asyncio.to_thread(_write_preview, path, preview.data)
             result.append(
                 MediaPayload(
                     media_type=media_type,
                     local_path=str(path),
-                    mime_type="image/jpeg",
+                    mime_type=preview.mime_type,
+                    width=preview.width,
+                    height=preview.height,
                     metadata={
                         "message_id": int(getattr(message, "id", 0) or 0),
-                        "preview_only": True,
+                        "preview_only": not allow_full_image,
+                        "source": "full_image_document" if allow_full_image else "telegram_thumbnail",
                     },
                 )
             )
@@ -598,20 +659,21 @@ class TelegramCollector:
         media: list[MediaPayload] = []
         media_obj = getattr(story, "media", None)
         if media_obj is not None:
-            data = await self._download_preview_bytes(client, media_obj)
-            if data:
+            preview = await self._download_preview_bytes(client, media_obj)
+            if preview:
                 safe_key = re.sub(r"[^A-Za-z0-9_.-]+", "_", key)
                 target_dir = self.settings.media_root / "telegram" / safe_key
-                target_dir.mkdir(parents=True, exist_ok=True)
                 path = target_dir / "story.jpg"
-                path.write_bytes(data)
+                await asyncio.to_thread(_write_preview, path, preview.data)
                 media_type = "photo" if "Photo" in type(media_obj).__name__ else "video_preview"
                 media.append(
                     MediaPayload(
                         media_type=media_type,
                         local_path=str(path),
-                        mime_type="image/jpeg",
-                        metadata={"preview_only": True},
+                        mime_type=preview.mime_type,
+                        width=preview.width,
+                        height=preview.height,
+                        metadata={"preview_only": True, "source": "telegram_thumbnail"},
                     )
                 )
         return CollectedItem(

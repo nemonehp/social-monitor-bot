@@ -34,7 +34,7 @@ def test_delivery_header_is_compact_and_uses_moscow_publication_time() -> None:
 
     header = DeliveryWorker._header(delivery)
 
-    assert header.startswith("<b>✈️ · ПОСТ · 18.07.2026 20:18</b>")
+    assert header.startswith("<b>🔵 TG · ПОСТ · 18.07.2026 20:18</b>")
     assert "НОВЫЙ" not in header
     assert "TELEGRAM" not in header
     assert "Тестовый текст" in header
@@ -59,7 +59,7 @@ def test_vk_story_header_uses_platform_icon() -> None:
         )
     )
 
-    assert DeliveryWorker._header(delivery).startswith("<b>🟦 · ИСТОРИЯ · 18.07.2026 03:00</b>")
+    assert DeliveryWorker._header(delivery).startswith("<b>🟢 VK · ИСТОРИЯ · 18.07.2026 03:00</b>")
 
 
 def test_importer_supports_generic_categories(tmp_path: Path) -> None:

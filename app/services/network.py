@@ -71,3 +71,7 @@ async def check_vk_access(proxy_url: str) -> None:
             data = await response.json(content_type=None)
             if not isinstance(data, dict):
                 raise RuntimeError("VK endpoint returned invalid response")
+            if error := data.get("error"):
+                raise RuntimeError(f"VK endpoint error: {error}")
+            if "response" not in data:
+                raise RuntimeError("VK endpoint returned no response payload")

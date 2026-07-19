@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -31,10 +33,56 @@ from app.db.repositories import DeliveryRepository
 from app.db.session import SessionFactory
 from app.services.alerts import AlertService
 from app.services.media_cleanup import cleanup_item_media
+from app.utils.platforms import platform_badge
 from app.utils.text import h
 
 logger = structlog.get_logger()
 MOSCOW = ZoneInfo("Europe/Moscow")
+
+
+@asynccontextmanager
+async def keep_delivery_leases(
+    delivery_ids: list[int],
+    lease_seconds: int,
+) -> AsyncIterator[None]:
+    """Keep a claimed source batch private while Telegram is sending it.
+
+    A temporary database hiccup must not turn an already accepted Telegram send
+    into an exception followed by a duplicate retry. Keep retrying the heartbeat,
+    log lease problems, and let the normal delivery transaction decide the result.
+    """
+    ids = list(dict.fromkeys(delivery_ids))
+    interval = max(5, min(60, lease_seconds // 3))
+    stopped = asyncio.Event()
+
+    async def heartbeat() -> None:
+        while True:
+            try:
+                await asyncio.wait_for(stopped.wait(), timeout=interval)
+                return
+            except TimeoutError:
+                pass
+            try:
+                async with SessionFactory() as session:
+                    async with session.begin():
+                        extended = await DeliveryRepository.extend_leases(
+                            session,
+                            ids,
+                            lease_seconds,
+                        )
+                if extended == 0:
+                    logger.warning("delivery_lease_lost", delivery_ids=ids)
+                    return
+            except Exception:
+                logger.exception("delivery_lease_heartbeat_failed", delivery_ids=ids)
+
+    task = asyncio.create_task(heartbeat())
+    try:
+        yield
+    finally:
+        stopped.set()
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
 
 
 class DeliveryWorker:
@@ -61,12 +109,12 @@ class DeliveryWorker:
         item = delivery.item
         source = item.source
         kind = "ИСТОРИЯ" if item.item_type == ItemType.STORY else "ПОСТ"
-        platform_icon = "🟦" if item.platform.value == "vk" else "✈️"
+        platform_label = platform_badge(item.platform)
         published = item.published_at or item.created_at or datetime.now(UTC)
         if published.tzinfo is None:
             published = published.replace(tzinfo=UTC)
         published_text = published.astimezone(MOSCOW).strftime("%d.%m.%Y %H:%M")
-        parts = [f"<b>{platform_icon} · {kind} · {published_text}</b>"]
+        parts = [f"<b>{platform_label} · {kind} · {published_text}</b>"]
         title = source.title or source.normalized_link
         if title:
             parts.extend(["", f"<b>{h(title)}</b>"])
@@ -112,7 +160,6 @@ class DeliveryWorker:
 
     async def _send(self, delivery: Delivery) -> list[int]:
         text = self._header(delivery, body_limit=3000)
-        caption_text = self._header(delivery, body_limit=650)
         keyboard = self._keyboard(delivery)
         media = self._existing_media(delivery.item.media)
         message_ids: list[int] = []
@@ -129,37 +176,45 @@ class DeliveryWorker:
         if len(media) == 1:
             row = media[0]
             file = FSInputFile(row.local_path)
+            # Telegram captions are limited to 1024 characters. When the card is
+            # longer, send the media without an excerpt and then send the full card
+            # exactly once. The old behaviour repeated the beginning of every long
+            # media post in both the caption and the following message.
+            fits_caption = len(text) <= 1000
+            caption = text if fits_caption else None
+            media_keyboard = keyboard if fits_caption else None
             try:
                 if row.media_type == "video":
                     message = await self.bot.send_video(
                         delivery.target_chat_id,
                         video=file,
-                        caption=caption_text,
-                        reply_markup=keyboard,
+                        caption=caption,
+                        reply_markup=media_keyboard,
                         supports_streaming=True,
                     )
                 elif row.media_type == "document":
                     message = await self.bot.send_document(
                         delivery.target_chat_id,
                         document=file,
-                        caption=caption_text,
-                        reply_markup=keyboard,
+                        caption=caption,
+                        reply_markup=media_keyboard,
                     )
                 else:
                     message = await self.bot.send_photo(
                         delivery.target_chat_id,
                         photo=file,
-                        caption=caption_text,
-                        reply_markup=keyboard,
+                        caption=caption,
+                        reply_markup=media_keyboard,
                     )
                 message_ids.append(message.message_id)
-                if len(text) > len(caption_text):
-                    extra = await self.bot.send_message(
+                if not fits_caption:
+                    card = await self.bot.send_message(
                         delivery.target_chat_id,
                         text[:4096],
                         reply_markup=keyboard,
+                        disable_web_page_preview=True,
                     )
-                    message_ids.append(extra.message_id)
+                    message_ids.append(card.message_id)
                 return message_ids
             except TelegramBadRequest as exc:
                 logger.warning("delivery_single_media_fallback", delivery_id=delivery.id, error=str(exc))
@@ -195,9 +250,21 @@ class DeliveryWorker:
         message_ids.append(card.message_id)
         return message_ids
 
-    async def _process_delivery(self, delivery: Delivery) -> tuple[bool, int]:
+    async def _process_delivery(
+        self,
+        delivery: Delivery,
+        lease_ids: list[int],
+    ) -> tuple[bool, int]:
         try:
-            message_ids = await self._send(delivery)
+            async with SessionFactory() as session:
+                async with session.begin():
+                    attempts = await DeliveryRepository.start_attempt(session, delivery.id)
+            if attempts is None:
+                logger.warning("delivery_lease_lost_before_send", delivery_id=delivery.id)
+                return False, 0
+            delivery.attempts = attempts
+            async with keep_delivery_leases(lease_ids, self.settings.job_lease_seconds):
+                message_ids = await self._send(delivery)
             async with SessionFactory() as session:
                 async with session.begin():
                     await DeliveryRepository.sent(session, delivery.id, message_ids)
@@ -283,7 +350,8 @@ class DeliveryWorker:
                     size=len(batch),
                 )
                 for index, delivery in enumerate(batch):
-                    success, delay = await self._process_delivery(delivery)
+                    lease_ids = [row.id for row in batch[index:]]
+                    success, delay = await self._process_delivery(delivery, lease_ids)
                     if success:
                         continue
                     remaining = [row.id for row in batch[index + 1 :]]

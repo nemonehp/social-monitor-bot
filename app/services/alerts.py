@@ -7,10 +7,10 @@ from aiogram import Bot
 from aiogram.exceptions import TelegramAPIError
 
 from app.config import Settings
-from app.db.enums import CredentialPlatform
 from app.db.models import Credential
 from app.db.repositories import AlertRepository, CredentialRepository
 from app.db.session import SessionFactory
+from app.utils.platforms import platform_badge
 from app.utils.text import h
 
 MOSCOW = ZoneInfo("Europe/Moscow")
@@ -66,7 +66,7 @@ class AlertService:
 
     @staticmethod
     def _dead_credential_text(credential: Credential) -> str:
-        platform = "VK" if credential.platform == CredentialPlatform.VK else "Telegram"
+        platform = platform_badge(credential.platform.value)
         when = credential.dead_since or datetime.now(UTC)
         when_msk = when.astimezone(MOSCOW).strftime("%d.%m.%Y %H:%M")
         return (

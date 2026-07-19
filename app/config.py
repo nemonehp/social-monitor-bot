@@ -32,8 +32,10 @@ class Settings(BaseSettings):
     credential_health_probe_posts: int = 5
     collection_overlap_seconds: int = 120
     media_max_previews_per_item: int = 4
-    media_max_preview_bytes: int = 2_000_000
-    media_max_image_edge: int = 1280
+    media_max_preview_bytes: int = 3_000_000
+    media_max_download_bytes: int = 12_000_000
+    media_max_image_edge: int = 1600
+    media_min_preview_edge: int = 320
     media_retention_hours: int = 24
     media_delete_after_delivery: bool = True
     job_history_days: int = 7

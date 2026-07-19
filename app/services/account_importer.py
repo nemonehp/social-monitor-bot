@@ -47,31 +47,31 @@ def parse_tg_accounts(text: str) -> tuple[list[TgAccountInput], list[str]]:
     result: list[TgAccountInput] = []
     errors: list[str] = []
     reader = csv.reader(io.StringIO(text))
-    for idx, parts in enumerate(reader, start=1):
-        parts = [p.strip() for p in parts]
-        if not parts or all(not p for p in parts):
+    for idx, row in enumerate(reader, start=1):
+        fields = [part.strip() for part in row]
+        if not fields or all(not part for part in fields):
             continue
-        if len(parts) > 4 and (parts[2].lower() == "hash" or parts[3].lower() == "api_id"):
+        if len(fields) > 4 and (fields[2].lower() == "hash" or fields[3].lower() == "api_id"):
             continue
-        if len(parts) < 10:
+        if len(fields) < 10:
             errors.append(f"Строка {idx}: требуется минимум 10 CSV-полей")
             continue
         try:
-            api_id = int(parts[3])
+            api_id = int(fields[3])
         except ValueError:
             errors.append(f"Строка {idx}: api_id не число")
             continue
         result.append(
             TgAccountInput(
-                label=parts[0] or f"tg-{idx}",
-                session=parts[2],
+                label=fields[0] or f"tg-{idx}",
+                session=fields[2],
                 api_id=api_id,
-                api_hash=parts[4],
-                device_model=parts[5],
-                system_version=parts[6],
-                app_version=parts[7],
-                system_lang_code=parts[8],
-                lang_code=parts[9],
+                api_hash=fields[4],
+                device_model=fields[5],
+                system_version=fields[6],
+                app_version=fields[7],
+                system_lang_code=fields[8],
+                lang_code=fields[9],
             )
         )
     return result, errors

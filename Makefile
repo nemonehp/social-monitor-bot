@@ -1,4 +1,4 @@
-.PHONY: up down logs test lint migrate key
+.PHONY: up down logs test lint quality migrate key
 
 up:
 	docker compose up -d --build
@@ -17,6 +17,9 @@ test:
 
 lint:
 	ruff check app tests
+
+quality:
+	./scripts/quality_check.sh
 
 key:
 	python scripts/generate_key.py

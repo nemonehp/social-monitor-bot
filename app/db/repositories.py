@@ -5,9 +5,11 @@ import hashlib
 from collections.abc import Iterable
 from datetime import UTC, datetime, timedelta
 from typing import Any
+from typing import cast as type_cast
 
 from sqlalchemy import String, and_, case, cast, func, or_, select, tuple_, update
 from sqlalchemy.dialects.postgresql import insert
+from sqlalchemy.engine import CursorResult
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -39,6 +41,10 @@ from app.db.models import (
 
 def utcnow() -> datetime:
     return datetime.now(UTC)
+
+
+def _rowcount(result: Any) -> int:
+    return int(type_cast(CursorResult[Any], result).rowcount or 0)
 
 
 class SettingsRepository:
@@ -250,10 +256,13 @@ class SourceRepository:
 
     @staticmethod
     async def get(session: AsyncSession, source_id: int) -> Source | None:
-        return await session.scalar(
-            select(Source)
-            .where(Source.id == source_id)
-            .options(selectinload(Source.state))
+        return type_cast(
+            Source | None,
+            await session.scalar(
+                select(Source)
+                .where(Source.id == source_id)
+                .options(selectinload(Source.state))
+            ),
         )
 
     @staticmethod
@@ -302,6 +311,7 @@ class SourceRepository:
         alphabetical_key = func.lower(
             func.coalesce(func.nullif(Source.title, ""), Source.normalized_link)
         )
+        order_by: tuple[Any, ...]
         if query:
             clean_query = query.strip()
             order_by = (
@@ -515,7 +525,7 @@ class JobRepository:
             )
             .values(status=JobStatus.RETRY, run_after=utcnow(), worker_id="", locked_until=None)
         )
-        return int(result.rowcount or 0)
+        return _rowcount(result)
 
     @staticmethod
     async def claim(
@@ -570,7 +580,7 @@ class JobRepository:
             )
             .values(locked_until=utcnow() + timedelta(seconds=lease_seconds))
         )
-        return bool(result.rowcount)
+        return _rowcount(result) > 0
 
     @staticmethod
     async def retry(
@@ -716,7 +726,7 @@ class DeliveryRepository:
             .where(Delivery.status == DeliveryStatus.RUNNING, Delivery.locked_until < utcnow())
             .values(status=DeliveryStatus.RETRY, run_after=utcnow(), locked_until=None)
         )
-        return int(result.rowcount or 0)
+        return _rowcount(result)
 
     @staticmethod
     def _load_options():
@@ -780,9 +790,20 @@ class DeliveryRepository:
         for delivery in rows:
             delivery.status = DeliveryStatus.RUNNING
             delivery.locked_until = locked_until
-            delivery.attempts += 1
         await session.flush()
         return rows
+
+    @staticmethod
+    async def start_attempt(session: AsyncSession, delivery_id: int) -> int | None:
+        return await session.scalar(
+            update(Delivery)
+            .where(
+                Delivery.id == delivery_id,
+                Delivery.status == DeliveryStatus.RUNNING,
+            )
+            .values(attempts=Delivery.attempts + 1)
+            .returning(Delivery.attempts)
+        )
 
     @staticmethod
     async def release(session: AsyncSession, delivery_ids: list[int], delay_seconds: int = 0) -> None:
@@ -797,6 +818,24 @@ class DeliveryRepository:
                 locked_until=None,
             )
         )
+
+    @staticmethod
+    async def extend_leases(
+        session: AsyncSession,
+        delivery_ids: list[int],
+        lease_seconds: int,
+    ) -> int:
+        if not delivery_ids:
+            return 0
+        result = await session.execute(
+            update(Delivery)
+            .where(
+                Delivery.id.in_(delivery_ids),
+                Delivery.status == DeliveryStatus.RUNNING,
+            )
+            .values(locked_until=utcnow() + timedelta(seconds=lease_seconds))
+        )
+        return _rowcount(result)
 
     @staticmethod
     async def sent(session: AsyncSession, delivery_id: int, message_ids: list[int]) -> None:
