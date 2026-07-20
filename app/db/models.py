@@ -209,6 +209,9 @@ class Credential(Base, TimestampMixin):
     __tablename__ = "credentials"
     __table_args__ = (
         UniqueConstraint("platform", "label", name="uq_credentials_platform_label"),
+        UniqueConstraint(
+            "platform", "external_account_id", name="uq_credentials_platform_external_account"
+        ),
         Index("ix_credentials_available", "platform", "status", "cooldown_until"),
         Index("ix_credentials_assigned_proxy", "assigned_proxy_id"),
     )
@@ -218,6 +221,7 @@ class Credential(Base, TimestampMixin):
         Enum(CredentialPlatform, name="credential_platform_enum"), nullable=False
     )
     label: Mapped[str] = mapped_column(String(255), nullable=False)
+    external_account_id: Mapped[str | None] = mapped_column(String(100), nullable=True)
     secret_encrypted: Mapped[str] = mapped_column(Text, nullable=False)
     config_json: Mapped[dict[str, Any]] = mapped_column(JSONB, default=dict, nullable=False)
     status: Mapped[CredentialStatus] = mapped_column(

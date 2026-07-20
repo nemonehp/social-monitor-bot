@@ -1093,7 +1093,11 @@ async def admin_accounts_vk(callback: CallbackQuery, state: FSMContext) -> None:
     await state.set_state(AdminState.waiting_vk_accounts)
     await edit_or_answer(
         callback,
-        "Отправьте VK-токены по одному на строку. Допустимо: label;token",
+        (
+            "Отправьте VK-токены по одному на строку. Label указывать не нужно: "
+            "бот сам запросит ID владельца через VK API и сохранит аккаунт как vk-ID.\n\n"
+            "Допустимы обычный токен, OAuth URL или JSON-ответ."
+        ),
         kb([[("Отмена", "admin:accounts")]]),
     )
     await callback.answer()
@@ -1101,19 +1105,28 @@ async def admin_accounts_vk(callback: CallbackQuery, state: FSMContext) -> None:
 
 @router.message(AdminState.waiting_vk_accounts, F.text)
 async def admin_accounts_vk_save(message: Message, state: FSMContext, settings: Settings) -> None:
-    accounts, errors = parse_vk_accounts(message.text or "")
-    created, updated = await CredentialManager(settings.app_encryption_key).save_vk(accounts)
+    accounts, parse_errors = parse_vk_accounts(message.text or "")
+    result = await CredentialManager(settings).save_vk(accounts)
+    errors = [*parse_errors, *result.errors]
     async with SessionFactory() as session:
         async with session.begin():
             await AuditRepository.write(
                 session,
                 _user_id(message),
                 "vk_accounts_imported",
-                payload={"created": created, "updated": updated, "errors": len(errors)},
+                payload={
+                    "created": result.created,
+                    "updated": result.updated,
+                    "duplicates_removed": result.duplicates_removed,
+                    "errors": len(errors),
+                },
             )
     await state.clear()
+    details = "\n".join(h(error) for error in errors[:10])
+    suffix = f"\n\n{details}" if details else ""
     await message.answer(
-        f"VK-токены: добавлено {created}, обновлено {updated}, ошибок {len(errors)}",
+        f"VK-аккаунты: добавлено {result.created}, обновлено {result.updated}, "
+        f"дублей удалено {result.duplicates_removed}, ошибок {len(errors)}{suffix}",
         reply_markup=accounts_menu(),
     )
 
@@ -1122,19 +1135,30 @@ async def admin_accounts_vk_save(message: Message, state: FSMContext, settings: 
 async def admin_accounts_vk_file(message: Message, state: FSMContext, bot: Bot, settings: Settings) -> None:
     buffer = io.BytesIO()
     await bot.download(_document(message), destination=buffer)
-    accounts, errors = parse_vk_accounts(buffer.getvalue().decode("utf-8-sig", errors="replace"))
-    created, updated = await CredentialManager(settings.app_encryption_key).save_vk(accounts)
+    accounts, parse_errors = parse_vk_accounts(
+        buffer.getvalue().decode("utf-8-sig", errors="replace")
+    )
+    result = await CredentialManager(settings).save_vk(accounts)
+    errors = [*parse_errors, *result.errors]
     async with SessionFactory() as session:
         async with session.begin():
             await AuditRepository.write(
                 session,
                 _user_id(message),
                 "vk_accounts_imported",
-                payload={"created": created, "updated": updated, "errors": len(errors)},
+                payload={
+                    "created": result.created,
+                    "updated": result.updated,
+                    "duplicates_removed": result.duplicates_removed,
+                    "errors": len(errors),
+                },
             )
     await state.clear()
+    details = "\n".join(h(error) for error in errors[:10])
+    suffix = f"\n\n{details}" if details else ""
     await message.answer(
-        f"VK-токены: добавлено {created}, обновлено {updated}, ошибок {len(errors)}",
+        f"VK-аккаунты: добавлено {result.created}, обновлено {result.updated}, "
+        f"дублей удалено {result.duplicates_removed}, ошибок {len(errors)}{suffix}",
         reply_markup=accounts_menu(),
     )
 
@@ -1153,7 +1177,7 @@ async def admin_accounts_tg(callback: CallbackQuery, state: FSMContext) -> None:
 @router.message(AdminState.waiting_tg_accounts, F.text)
 async def admin_accounts_tg_save(message: Message, state: FSMContext, settings: Settings) -> None:
     accounts, errors = parse_tg_accounts(message.text or "")
-    created, updated = await CredentialManager(settings.app_encryption_key).save_tg(accounts)
+    created, updated = await CredentialManager(settings).save_tg(accounts)
     async with SessionFactory() as session:
         async with session.begin():
             await AuditRepository.write(
@@ -1174,7 +1198,7 @@ async def admin_accounts_tg_file(message: Message, state: FSMContext, bot: Bot, 
     buffer = io.BytesIO()
     await bot.download(_document(message), destination=buffer)
     accounts, errors = parse_tg_accounts(buffer.getvalue().decode("utf-8-sig", errors="replace"))
-    created, updated = await CredentialManager(settings.app_encryption_key).save_tg(accounts)
+    created, updated = await CredentialManager(settings).save_tg(accounts)
     async with SessionFactory() as session:
         async with session.begin():
             await AuditRepository.write(

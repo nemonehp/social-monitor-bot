@@ -7,7 +7,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 from typing import cast as type_cast
 
-from sqlalchemy import String, and_, case, cast, func, or_, select, tuple_, update
+from sqlalchemy import String, and_, case, cast, delete, func, or_, select, tuple_, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.engine import CursorResult
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -26,6 +26,7 @@ from app.db.enums import (
 from app.db.models import (
     AlertState,
     AllowedUser,
+    ApiUsage,
     AppSetting,
     AuditLog,
     CollectionJob,
@@ -898,6 +899,141 @@ class DeliveryRepository:
 
 
 class CredentialRepository:
+    @staticmethod
+    async def _merge_duplicate_usage(
+        session: AsyncSession,
+        canonical_id: int,
+        duplicate_ids: list[int],
+    ) -> None:
+        if not duplicate_ids:
+            return
+        rows = await session.execute(
+            select(
+                ApiUsage.usage_date,
+                func.sum(ApiUsage.request_count),
+                func.sum(ApiUsage.source_checks),
+                func.sum(ApiUsage.rate_limit_events),
+            )
+            .where(ApiUsage.credential_id.in_(duplicate_ids))
+            .group_by(ApiUsage.usage_date)
+        )
+        for usage_date, request_count, source_checks, rate_limit_events in rows:
+            values = {
+                "credential_id": canonical_id,
+                "platform": CredentialPlatform.VK.value,
+                "usage_date": usage_date,
+                "request_count": int(request_count or 0),
+                "source_checks": int(source_checks or 0),
+                "rate_limit_events": int(rate_limit_events or 0),
+            }
+            statement = insert(ApiUsage).values(**values)
+            statement = statement.on_conflict_do_update(
+                constraint="uq_api_usage_credential_date",
+                set_={
+                    "request_count": ApiUsage.request_count + values["request_count"],
+                    "source_checks": ApiUsage.source_checks + values["source_checks"],
+                    "rate_limit_events": ApiUsage.rate_limit_events + values["rate_limit_events"],
+                    "updated_at": utcnow(),
+                },
+            )
+            await session.execute(statement)
+
+    @staticmethod
+    async def upsert_vk_identity(
+        session: AsyncSession,
+        *,
+        account_id: int,
+        encrypted_secret: str,
+        config: dict[str, Any],
+        expires_at: datetime | None,
+    ) -> tuple[Credential, bool, int]:
+        identity = str(account_id)
+        canonical_label = f"vk-{identity}"
+        candidates = list(
+            await session.scalars(
+                select(Credential)
+                .where(
+                    Credential.platform == CredentialPlatform.VK,
+                    or_(
+                        Credential.external_account_id == identity,
+                        Credential.config_json["user_id"].astext == identity,
+                    ),
+                )
+                .order_by(
+                    case(
+                        (Credential.external_account_id == identity, 0),
+                        (Credential.status == CredentialStatus.ACTIVE, 1),
+                        else_=2,
+                    ),
+                    Credential.id,
+                )
+                .with_for_update()
+            )
+        )
+
+        label_owner = await session.scalar(
+            select(Credential)
+            .where(
+                Credential.platform == CredentialPlatform.VK,
+                Credential.label == canonical_label,
+            )
+            .with_for_update()
+        )
+        if label_owner is not None and label_owner not in candidates:
+            # v1.3.2 generated labels from input line numbers (`vk-1`,
+            # `vk-2`, ...). Never treat such a label as account identity.
+            label_owner.label = f"vk-legacy-{label_owner.id}"
+            await session.flush()
+
+        if not candidates:
+            row = Credential(
+                platform=CredentialPlatform.VK,
+                label=canonical_label,
+                external_account_id=identity,
+                secret_encrypted=encrypted_secret,
+                config_json={**config, "user_id": account_id},
+                expires_at=expires_at,
+                status=CredentialStatus.ACTIVE,
+            )
+            session.add(row)
+            await session.flush()
+            return row, True, 0
+
+        canonical = candidates[0]
+        duplicates = candidates[1:]
+        duplicate_ids = [row.id for row in duplicates]
+        await CredentialRepository._merge_duplicate_usage(session, canonical.id, duplicate_ids)
+
+        # Preserve stable proxy affinity when the oldest/canonical record did not
+        # have it but a duplicate did. All other runtime counters are merged.
+        proxy_source = next((row for row in duplicates if row.assigned_proxy_id is not None), None)
+        if canonical.assigned_proxy_id is None and proxy_source is not None:
+            canonical.assigned_proxy_id = proxy_source.assigned_proxy_id
+            canonical.assigned_external_ip = proxy_source.assigned_external_ip
+            canonical.assignment_epoch = proxy_source.assignment_epoch
+        canonical.requests_count += sum(row.requests_count for row in duplicates)
+        canonical.rate_limit_events += sum(row.rate_limit_events for row in duplicates)
+        successful = [row.last_success_at for row in candidates if row.last_success_at is not None]
+        if successful:
+            canonical.last_success_at = max(successful)
+
+        if duplicate_ids:
+            await session.execute(delete(Credential).where(Credential.id.in_(duplicate_ids)))
+            await session.flush()
+
+        canonical.label = canonical_label
+        canonical.external_account_id = identity
+        canonical.secret_encrypted = encrypted_secret
+        canonical.config_json = {**canonical.config_json, **config, "user_id": account_id}
+        canonical.expires_at = expires_at
+        canonical.status = CredentialStatus.ACTIVE
+        canonical.cooldown_until = None
+        canonical.last_error = ""
+        canonical.health_failures = 0
+        canonical.dead_since = None
+        canonical.dead_notified_at = None
+        return canonical, False, len(duplicates)
+
     @staticmethod
     async def add(
         session: AsyncSession,

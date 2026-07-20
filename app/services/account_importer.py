@@ -10,7 +10,7 @@ from urllib.parse import parse_qs, urlparse
 
 @dataclass(slots=True)
 class VkAccountInput:
-    label: str
+    line_number: int
     token: str
     expires_at: datetime | None = None
     config: dict[str, str | int] = field(default_factory=dict)
@@ -75,12 +75,13 @@ def parse_vk_accounts(text: str) -> tuple[list[VkAccountInput], list[str]]:
         value = line.strip()
         if not value or value.startswith("#"):
             continue
-        label = f"vk-{idx}"
         payload = value
+        # Legacy `label;token` rows are accepted for a painless upgrade, but the
+        # label is deliberately ignored. VK users.get is the identity source.
         if ";" in value and not value.startswith("{"):
-            first, rest = value.split(";", 1)
+            _legacy_label, rest = value.split(";", 1)
             if "access_token=" in rest or len(rest.strip()) >= 20:
-                label, payload = first.strip() or label, rest.strip()
+                payload = rest.strip()
         try:
             token, expires_at, config = _vk_payload(payload)
         except (ValueError, TypeError, json.JSONDecodeError) as exc:
@@ -91,7 +92,7 @@ def parse_vk_accounts(text: str) -> tuple[list[VkAccountInput], list[str]]:
             continue
         result.append(
             VkAccountInput(
-                label=label,
+                line_number=idx,
                 token=token,
                 expires_at=expires_at,
                 config=config,

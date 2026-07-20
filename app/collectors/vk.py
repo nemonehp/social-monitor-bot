@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -26,6 +27,18 @@ from app.db.models import Source
 from app.services.image_preview import decorate_video_preview, prepare_preview
 from app.services.network import proxy_session
 from app.utils.text import clean_text
+
+
+@dataclass(frozen=True, slots=True)
+class VkAccountIdentity:
+    user_id: int
+    display_name: str
+    screen_name: str
+
+    @property
+    def label(self) -> str:
+        return f"vk-{self.user_id}"
+
 
 TOKEN_DEAD_CODES = {5, 17, 27, 28, 1116}
 RETRY_CODES = {6, 9, 10, 14, 29}
@@ -124,6 +137,41 @@ class VkCollector:
                 raise NotFoundError(str(error)) from error
             raise RetryableCollectorError(str(error)) from error
         return data
+
+    @staticmethod
+    def _identity_from_response(data: dict[str, Any]) -> VkAccountIdentity:
+        response = data.get("response")
+        if not isinstance(response, list) or not response or not isinstance(response[0], dict):
+            raise CredentialDeadError("VK users.get returned no current account")
+        profile = response[0]
+        user_id = int(profile.get("id") or 0)
+        if user_id <= 0:
+            raise CredentialDeadError("VK users.get returned invalid current account ID")
+        first_name = str(profile.get("first_name") or "").strip()
+        last_name = str(profile.get("last_name") or "").strip()
+        display_name = " ".join(part for part in (first_name, last_name) if part) or f"VK ID {user_id}"
+        screen_name = str(profile.get("screen_name") or "").strip()
+        return VkAccountIdentity(
+            user_id=user_id,
+            display_name=display_name,
+            screen_name=screen_name,
+        )
+
+    async def resolve_current_account(
+        self,
+        token: str,
+        *,
+        proxy_url: str | None = None,
+    ) -> VkAccountIdentity:
+        params = {"fields": "screen_name"}
+        if proxy_url:
+            async with proxy_session(proxy_url, timeout_seconds=30) as (session, request_proxy):
+                data = await self._call(session, request_proxy, token, "users.get", params)
+        else:
+            timeout = aiohttp.ClientTimeout(total=30, connect=15)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                data = await self._call(session, None, token, "users.get", params)
+        return self._identity_from_response(data)
 
     @staticmethod
     def _parse_owner_hint(source: Source) -> tuple[int | None, str]:
