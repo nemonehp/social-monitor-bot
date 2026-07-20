@@ -1,3 +1,10 @@
+## v1.3.4 — integrity counter guard
+
+- Исправлено падение первого integrity-gap для нового источника: ORM insert-default больше не используется до flush как Python-значение.
+- Счётчик `consecutive_gaps` явно инициализируется нулём и безопасно нормализуется перед увеличением.
+- Добавлена миграция `0006_integrity_counter_guard`, обнуляющая возможные legacy-NULL и закрепляющая server default/NOT NULL.
+- Задания, упавшие на старом `None += 1`, остаются в retry и автоматически продолжатся после обновления без продвижения checkpoint.
+
 ## v1.3.3 — canonical VK account identity
 
 - Пользовательский label для VK больше не запрашивается и не участвует в дедупликации.

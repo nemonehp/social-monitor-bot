@@ -26,6 +26,15 @@ def _as_int(value: object) -> int:
         return 0
 
 
+def _next_consecutive_gap(value: object) -> int:
+    """Increment an ORM counter safely before SQLAlchemy insert defaults are applied."""
+
+    try:
+        return max(0, int(value or 0)) + 1
+    except (TypeError, ValueError):
+        return 1
+
+
 def _item_ids(external_id: str, raw_json: dict[str, Any] | None) -> set[int]:
     ids = {_as_int(external_id)}
     raw = raw_json or {}
@@ -112,7 +121,10 @@ async def assess_collection_integrity(
     }
     row = await session.get(IntegrityCheck, source.id)
     if row is None:
-        row = IntegrityCheck(source_id=source.id)
+        # SQLAlchemy applies mapped_column(default=0) during INSERT, not when the
+        # Python object is constructed. Set the counter explicitly so the first
+        # suspected gap cannot evaluate None + 1 before session.flush().
+        row = IntegrityCheck(source_id=source.id, consecutive_gaps=0)
         session.add(row)
     row.last_checked_at = datetime.now(UTC)
     row.last_remote_post_id = str(remote_post or "")
@@ -122,7 +134,7 @@ async def assess_collection_integrity(
     row.details_json = details
     if suspected:
         row.status = "suspected_gap"
-        row.consecutive_gaps += 1
+        row.consecutive_gaps = _next_consecutive_gap(row.consecutive_gaps)
     else:
         row.status = "ok"
         row.consecutive_gaps = 0
