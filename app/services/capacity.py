@@ -41,6 +41,52 @@ class CapacitySnapshot:
         return max(0, self.required_proxy_ips - self.proxy_ip_count)
 
 
+@dataclass(frozen=True, slots=True)
+class CapacityPlan:
+    """Requested and safe effective interval for one platform.
+
+    A global interval is a user preference, not an all-or-nothing transaction.
+    Each platform independently receives the closest safe interval.  ``None``
+    means that no finite interval can be supported with the currently usable
+    credentials/IPs, so only that platform is paused.
+    """
+
+    platform: Platform
+    requested_interval_seconds: int
+    effective_interval_seconds: int | None
+    requested: CapacitySnapshot
+    effective: CapacitySnapshot | None
+
+    @property
+    def paused(self) -> bool:
+        return self.effective_interval_seconds is None
+
+    @property
+    def limited(self) -> bool:
+        return (
+            self.effective_interval_seconds is not None
+            and self.effective_interval_seconds > self.requested_interval_seconds
+        )
+
+    @property
+    def restricted(self) -> bool:
+        return self.paused or self.limited
+
+    @property
+    def active_snapshot(self) -> CapacitySnapshot:
+        return self.effective or self.requested
+
+
+@dataclass(frozen=True, slots=True)
+class _CapacityInputs:
+    platform: Platform
+    source_intervals: tuple[int | None, ...]
+    account_count: int
+    proxy_ip_count: int
+    used_requests_today: int
+    account_safe_total: int
+
+
 def cycles_per_day(interval_seconds: int) -> int:
     return math.ceil(SECONDS_PER_DAY / max(1, interval_seconds))
 
@@ -122,21 +168,16 @@ async def usage_map_today(session: AsyncSession, credential_ids: list[int]) -> d
     return {int(credential_id): int(request_count) for credential_id, request_count in rows}
 
 
-async def calculate_capacity(
-    session: AsyncSession,
-    *,
-    platform: Platform,
-    interval_seconds: int,
-    settings: Settings,
-) -> CapacitySnapshot:
-    source_intervals = list(
+async def _load_capacity_inputs(
+    session: AsyncSession, platform: Platform, settings: Settings
+) -> _CapacityInputs:
+    source_intervals = tuple(
         await session.scalars(
             select(Source.poll_interval_seconds).where(
                 Source.platform == platform, Source.status == SourceStatus.ACTIVE
             )
         )
     )
-    source_count = len(source_intervals)
     credentials = await _eligible_credentials(session, platform)
     usage = await usage_map_today(session, [row.id for row in credentials])
     budgets = {
@@ -144,7 +185,6 @@ async def calculate_capacity(
         for row in credentials
     }
     usable = [row for row in credentials if usage.get(row.id, 0) < budgets[row.id]]
-    account_count = len(usable)
     used_today = sum(min(usage.get(row.id, 0), budgets[row.id]) for row in usable)
     account_safe_total = sum(budgets[row.id] for row in usable)
 
@@ -160,58 +200,85 @@ async def calculate_capacity(
             or 0
         )
 
+    return _CapacityInputs(
+        platform=platform,
+        source_intervals=source_intervals,
+        account_count=len(usable),
+        proxy_ip_count=proxy_ip_count,
+        used_requests_today=used_today,
+        account_safe_total=account_safe_total,
+    )
+
+
+def _snapshot_from_inputs(
+    inputs: _CapacityInputs,
+    interval_seconds: int,
+    settings: Settings,
+    *,
+    now: datetime | None = None,
+) -> CapacitySnapshot:
+    timestamp = now or datetime.now(UTC)
+    source_count = len(inputs.source_intervals)
     cost = (
         settings.vk_estimated_requests_per_source_cycle
-        if platform == Platform.VK
+        if inputs.platform == Platform.VK
         else settings.tg_estimated_requests_per_source_cycle
     )
-    estimated = math.ceil(sum(cycles_per_day(value or interval_seconds) * cost for value in source_intervals))
-    nominal_per_account = safe_budget_per_account(platform, settings)
+    estimated = math.ceil(
+        sum(cycles_per_day(value or interval_seconds) * cost for value in inputs.source_intervals)
+    )
+    nominal_per_account = safe_budget_per_account(inputs.platform, settings)
     required_accounts = math.ceil(estimated / nominal_per_account) if estimated else 0
     required_proxy_ips = (
         math.ceil(required_accounts / settings.vk_max_accounts_per_ip)
-        if platform == Platform.VK and required_accounts
+        if inputs.platform == Platform.VK and required_accounts
         else 0
     )
-    safe_total = account_safe_total
-    if platform == Platform.VK:
+
+    safe_total = inputs.account_safe_total
+    if inputs.platform == Platform.VK:
         safe_total = min(
             safe_total,
-            proxy_ip_count * settings.vk_max_accounts_per_ip * nominal_per_account,
+            inputs.proxy_ip_count * settings.vk_max_accounts_per_ip * nominal_per_account,
         )
-    remaining = max(0, safe_total - used_today)
+    remaining = max(0, safe_total - inputs.used_requests_today)
     utilization = estimated / safe_total if safe_total else (math.inf if estimated else 0.0)
+
+    elapsed_seconds = timestamp.hour * 3600 + timestamp.minute * 60 + timestamp.second
+    remaining_fraction = max(0.0, (SECONDS_PER_DAY - elapsed_seconds) / SECONDS_PER_DAY)
+    requests_needed_for_rest_of_day = math.ceil(estimated * remaining_fraction)
 
     allowed = True
     reason = ""
-    if source_count and account_count < required_accounts:
+    if source_count and inputs.account_count == 0:
+        allowed = False
+        reason = "no_accounts"
+    elif inputs.platform == Platform.VK and source_count and inputs.proxy_ip_count == 0:
+        allowed = False
+        reason = "no_proxy_ips"
+    elif source_count and inputs.account_count < required_accounts:
         allowed = False
         reason = "insufficient_accounts"
-    if platform == Platform.VK and source_count and proxy_ip_count < required_proxy_ips:
+    elif (
+        inputs.platform == Platform.VK
+        and source_count
+        and inputs.proxy_ip_count < required_proxy_ips
+    ):
         allowed = False
         reason = "insufficient_proxy_ips"
-    # Daily budget is a hard stop. The scheduler leaves checkpoints untouched and
-    # resumes automatically after UTC day rollover or extra capacity is added.
-    expected_today = math.ceil(
-        estimated
-        * (
-            (datetime.now(UTC).hour * 3600 + datetime.now(UTC).minute * 60 + datetime.now(UTC).second)
-            / SECONDS_PER_DAY
-        )
-    )
-    if source_count and remaining <= max(1, estimated - expected_today):
+    elif source_count and remaining < requests_needed_for_rest_of_day:
         allowed = False
         reason = "daily_budget_exhausted"
 
     return CapacitySnapshot(
-        platform=platform,
+        platform=inputs.platform,
         interval_seconds=interval_seconds,
         source_count=source_count,
-        account_count=account_count,
-        proxy_ip_count=proxy_ip_count,
+        account_count=inputs.account_count,
+        proxy_ip_count=inputs.proxy_ip_count,
         estimated_requests_per_day=estimated,
         safe_requests_per_day=safe_total,
-        used_requests_today=used_today,
+        used_requests_today=inputs.used_requests_today,
         remaining_requests_today=remaining,
         required_accounts=required_accounts,
         required_proxy_ips=required_proxy_ips,
@@ -219,6 +286,79 @@ async def calculate_capacity(
         allowed=allowed,
         reason=reason,
     )
+
+
+def _plan_from_inputs(
+    inputs: _CapacityInputs,
+    requested_interval_seconds: int,
+    settings: Settings,
+    *,
+    now: datetime | None = None,
+) -> CapacityPlan:
+    requested = _snapshot_from_inputs(inputs, requested_interval_seconds, settings, now=now)
+    if requested.allowed:
+        return CapacityPlan(
+            inputs.platform,
+            requested_interval_seconds,
+            requested_interval_seconds,
+            requested,
+            requested,
+        )
+
+    if requested.source_count == 0:
+        return CapacityPlan(
+            inputs.platform,
+            requested_interval_seconds,
+            requested_interval_seconds,
+            requested,
+            requested,
+        )
+
+    # No interval can compensate for a completely absent credential/IP pool.
+    if inputs.account_count == 0 or (inputs.platform == Platform.VK and inputs.proxy_ip_count == 0):
+        return CapacityPlan(inputs.platform, requested_interval_seconds, None, requested, None)
+
+    maximum = max(
+        requested_interval_seconds,
+        int(settings.capacity_max_effective_interval_seconds),
+    )
+    slowest = _snapshot_from_inputs(inputs, maximum, settings, now=now)
+    if not slowest.allowed:
+        return CapacityPlan(inputs.platform, requested_interval_seconds, None, requested, None)
+
+    low = requested_interval_seconds
+    high = maximum
+    while low + 1 < high:
+        middle = (low + high) // 2
+        candidate = _snapshot_from_inputs(inputs, middle, settings, now=now)
+        if candidate.allowed:
+            high = middle
+        else:
+            low = middle
+    effective = _snapshot_from_inputs(inputs, high, settings, now=now)
+    return CapacityPlan(inputs.platform, requested_interval_seconds, high, requested, effective)
+
+
+async def calculate_capacity(
+    session: AsyncSession,
+    *,
+    platform: Platform,
+    interval_seconds: int,
+    settings: Settings,
+) -> CapacitySnapshot:
+    inputs = await _load_capacity_inputs(session, platform, settings)
+    return _snapshot_from_inputs(inputs, interval_seconds, settings)
+
+
+async def calculate_capacity_plan(
+    session: AsyncSession,
+    *,
+    platform: Platform,
+    requested_interval_seconds: int,
+    settings: Settings,
+) -> CapacityPlan:
+    inputs = await _load_capacity_inputs(session, platform, settings)
+    return _plan_from_inputs(inputs, requested_interval_seconds, settings)
 
 
 async def calculate_all_capacities(
@@ -232,35 +372,96 @@ async def calculate_all_capacities(
     }
 
 
-def capacity_alert_text(snapshot: CapacitySnapshot) -> str:
-    label = "VK" if snapshot.platform == Platform.VK else "Telegram"
+async def calculate_all_capacity_plans(
+    session: AsyncSession, requested_interval_seconds: int, settings: Settings
+) -> dict[Platform, CapacityPlan]:
+    return {
+        platform: await calculate_capacity_plan(
+            session,
+            platform=platform,
+            requested_interval_seconds=requested_interval_seconds,
+            settings=settings,
+        )
+        for platform in (Platform.VK, Platform.TELEGRAM)
+    }
+
+
+def _number(value: int) -> str:
+    return f"{value:,}".replace(",", " ")
+
+
+def capacity_alert_text(plan: CapacityPlan) -> str:
+    label = "VK" if plan.platform == Platform.VK else "Telegram"
+    requested = plan.requested
+    if plan.paused:
+        title = f"⚠️ <b>{label}: сбор приостановлен</b>"
+        effective_line = "Фактический интервал: пауза"
+    else:
+        title = f"⚠️ <b>{label}: частота ограничена безопасным уровнем</b>"
+        effective_line = f"Фактический интервал: {plan.effective_interval_seconds} сек."
+
     lines = [
-        f"⚠️ <b>Недостаточно безопасной мощности для {label}</b>",
+        title,
         "",
-        f"Источников: {snapshot.source_count}",
-        f"Интервал: {snapshot.interval_seconds} сек.",
-        f"Расчётная нагрузка: {snapshot.estimated_requests_per_day:,} ед./сутки".replace(",", " "),
-        f"Безопасная ёмкость: {snapshot.safe_requests_per_day:,} ед./сутки".replace(",", " "),
-        f"Использовано сегодня: {snapshot.used_requests_today:,}".replace(",", " "),
-        f"Аккаунтов доступно: {snapshot.account_count}",
-        f"Аккаунтов требуется: {snapshot.required_accounts}",
+        f"Запрошенный интервал: {plan.requested_interval_seconds} сек.",
+        effective_line,
+        f"Источников: {requested.source_count}",
+        f"Нагрузка при запрошенной частоте: {_number(requested.estimated_requests_per_day)} ед./сутки",
+        f"Безопасная ёмкость: {_number(requested.safe_requests_per_day)} ед./сутки",
+        f"Рабочих аккаунтов: {requested.account_count}; для запрошенной частоты нужно {requested.required_accounts}",
     ]
-    if snapshot.platform == Platform.VK:
+    if plan.platform == Platform.VK:
+        ip_state = "достаточно" if requested.proxy_ip_count >= requested.required_proxy_ips else "недостаточно"
         lines.extend(
             [
-                f"Уникальных рабочих IP: {snapshot.proxy_ip_count}",
-                f"IP требуется: {snapshot.required_proxy_ips}",
-                "Лимит привязки: 3 VK-аккаунта на IP",
+                f"Уникальных рабочих IP: {requested.proxy_ip_count}; нужно {requested.required_proxy_ips} ({ip_state})",
+                "Ограничение: не более 3 VK-аккаунтов на один IP",
             ]
         )
-    lines.extend(
-        [
-            "",
-            "Новые проверки этой платформы приостановлены; очередь и checkpoint сохранены.",
-            "Добавьте аккаунты/прокси с новыми IP либо увеличьте интервал проверки.",
-        ]
-    )
+
+    reason_text = {
+        "no_accounts": "Причина: нет рабочих аккаунтов этой платформы.",
+        "no_proxy_ips": "Причина: нет рабочих прокси с определённым внешним IP.",
+        "insufficient_accounts": "Причина: рабочих аккаунтов недостаточно для запрошенной частоты.",
+        "insufficient_proxy_ips": "Причина: уникальных IP недостаточно для безопасного размещения VK-аккаунтов.",
+        "daily_budget_exhausted": "Причина: безопасный бюджет запросов на текущие сутки исчерпан.",
+    }.get(requested.reason, "Причина: текущей мощности недостаточно для запрошенной частоты.")
+    lines.extend(["", reason_text])
+
+    if plan.paused:
+        lines.append("Очередь и checkpoint сохранены; после появления мощности сбор продолжится автоматически.")
+    else:
+        lines.append(
+            f"{label} продолжает работать с интервалом {plan.effective_interval_seconds} сек.; "
+            "другие платформы не замедляются."
+        )
+    if requested.account_deficit:
+        lines.append(f"Добавьте рабочих аккаунтов: минимум {requested.account_deficit}.")
+    if requested.proxy_ip_deficit:
+        lines.append(f"Добавьте уникальных IP: минимум {requested.proxy_ip_deficit}.")
     return "\n".join(lines)
+
+
+def capacity_plan_line(plan: CapacityPlan) -> str:
+    badge = "🟢 VK" if plan.platform == Platform.VK else "🔵 TG"
+    snapshot = plan.active_snapshot
+    if plan.paused:
+        state = f"ПАУЗА · запрошено {plan.requested_interval_seconds} сек."
+    elif plan.limited:
+        state = (
+            f"ограничено до {plan.effective_interval_seconds} сек. "
+            f"(запрошено {plan.requested_interval_seconds})"
+        )
+    else:
+        state = f"работает · {plan.requested_interval_seconds} сек."
+    line = (
+        f"{badge}: {state} · нагрузка {_number(snapshot.estimated_requests_per_day)} / "
+        f"ёмкость {_number(snapshot.safe_requests_per_day)} ед./сутки · "
+        f"аккаунты {snapshot.account_count}/{snapshot.required_accounts}"
+    )
+    if plan.platform == Platform.VK:
+        line += f" · IP {snapshot.proxy_ip_count}/{snapshot.required_proxy_ips}"
+    return line
 
 
 async def record_api_usage(

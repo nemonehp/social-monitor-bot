@@ -38,6 +38,19 @@ class AllowlistMiddleware(BaseMiddleware):
         event: TelegramObject,
         data: dict[str, Any],
     ) -> Any:
+        # Group/service messages must never trigger private allowlist warnings.
+        # The only supported group interaction is the one-time /start bind_...
+        # command; its handler performs the administrator and token checks.
+        if isinstance(event, Message) and event.chat.type != "private":
+            text = event.text or ""
+            if text.startswith("/start") and "bind_" in text:
+                return await handler(event, data)
+            return None
+        if isinstance(event, CallbackQuery):
+            message = event.message
+            if isinstance(message, Message) and message.chat.type != "private":
+                return None
+
         user = data.get("event_from_user")
         if user is None:
             return await handler(event, data)

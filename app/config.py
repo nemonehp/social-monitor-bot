@@ -41,6 +41,7 @@ class Settings(BaseSettings):
     vk_max_accounts_per_ip: int = 3
     capacity_guard_enabled: bool = True
     capacity_alert_repeat_minutes: int = 360
+    capacity_max_effective_interval_seconds: int = 86_400
     integrity_gap_retry_seconds: int = 15
     integrity_gap_alert_after: int = 3
     token_rate_limit_penalty_minutes: int = 60

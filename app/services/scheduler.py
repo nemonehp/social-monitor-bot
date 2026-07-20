@@ -33,7 +33,11 @@ from app.db.repositories import (
 from app.db.session import SessionFactory
 from app.security import SecretBox
 from app.services.alerts import AlertService
-from app.services.capacity import calculate_all_capacities, capacity_alert_text
+from app.services.capacity import (
+    calculate_all_capacity_plans,
+    capacity_alert_text,
+    capacity_plan_line,
+)
 from app.services.media_cleanup import cleanup_delivered_media
 from app.services.network import check_direct_ip, check_proxy, check_vk_access
 from app.utils.platforms import platform_badge
@@ -64,7 +68,7 @@ class Scheduler:
                     await SettingsRepository.set(session, "daily_report_last_date", yesterday_msk.isoformat())
 
     async def schedule(self) -> None:
-        snapshots = {}
+        plans = {}
         deferred: dict[str, int] = {}
         async with SessionFactory() as session:
             async with session.begin():
@@ -78,38 +82,46 @@ class Scheduler:
                 recovered_jobs = await JobRepository.recover_expired(session)
                 recovered_deliveries = await DeliveryRepository.recover_expired(session)
                 expired_credentials = await CredentialRepository.expire_due(session)
-                allowed_platforms = {Platform.VK, Platform.TELEGRAM}
+                effective_intervals = {
+                    Platform.VK: interval,
+                    Platform.TELEGRAM: interval,
+                }
                 if self.settings.capacity_guard_enabled:
-                    snapshots = await calculate_all_capacities(session, interval, self.settings)
-                    allowed_platforms = {
-                        platform for platform, snapshot in snapshots.items() if snapshot.allowed
+                    plans = await calculate_all_capacity_plans(session, interval, self.settings)
+                    effective_intervals = {
+                        platform: plan.effective_interval_seconds
+                        for platform, plan in plans.items()
+                        if plan.effective_interval_seconds is not None
                     }
-                    for platform, snapshot in snapshots.items():
-                        if not snapshot.allowed:
+                    for platform, plan in plans.items():
+                        if plan.paused:
                             deferred[platform.value] = await JobRepository.defer_platform(
                                 session,
                                 platform,
                                 delay_seconds=max(60, interval),
                             )
+                allowed_platforms = set(effective_intervals)
                 created = await JobRepository.schedule_due_sources(
                     session,
-                    default_interval=interval,
+                    default_intervals=effective_intervals,
                     limit=2000,
                     allowed_platforms=allowed_platforms,
                 )
-        for platform, snapshot in snapshots.items():
+        for platform, plan in plans.items():
+            requested = plan.requested
             await self.alerts.send_stateful(
                 f"capacity:{platform.value}",
-                active=not snapshot.allowed,
-                active_text=capacity_alert_text(snapshot),
+                active=plan.restricted,
+                active_text=capacity_alert_text(plan),
                 payload={
-                    "reason": snapshot.reason,
-                    "sources": snapshot.source_count,
-                    "accounts": snapshot.account_count,
-                    "proxy_ips": snapshot.proxy_ip_count,
-                    "required_accounts": snapshot.required_accounts,
-                    "required_proxy_ips": snapshot.required_proxy_ips,
-                    "interval": interval,
+                    "reason": requested.reason,
+                    "sources": requested.source_count,
+                    "accounts": requested.account_count,
+                    "proxy_ips": requested.proxy_ip_count,
+                    "required_accounts": requested.required_accounts,
+                    "required_proxy_ips": requested.required_proxy_ips,
+                    "requested_interval": plan.requested_interval_seconds,
+                    "effective_interval": plan.effective_interval_seconds,
                 },
                 repeat_while_active=True,
                 cooldown_minutes=self.settings.capacity_alert_repeat_minutes,
@@ -313,21 +325,23 @@ class Scheduler:
             active_text="",
             payload={"superseded_by": "capacity:vk"},
         )
+        # Zero-account conditions are already represented by capacity:<platform>.
+        # Keep the legacy alert keys inactive to prevent duplicate warnings.
         await self.alerts.send_stateful(
             "vk_accounts_zero",
-            active=vk_pool_accounts == 0,
-            active_text="⚠️ Нет доступных VK-токенов. Сбор VK остановлен.",
-            payload={"active": active_vk, "pool": vk_pool_accounts},
-            repeat_while_active=True,
-            cooldown_minutes=self.settings.health_alert_repeat_minutes,
+            active=False,
+            active_text="",
+            payload={"superseded_by": "capacity:vk", "active": active_vk, "pool": vk_pool_accounts},
         )
         await self.alerts.send_stateful(
             "tg_accounts_zero",
-            active=tg_pool_accounts == 0,
-            active_text="⚠️ Нет доступных Telegram-сессий. Сбор Telegram остановлен.",
-            payload={"active": active_tg, "pool": tg_pool_accounts},
-            repeat_while_active=True,
-            cooldown_minutes=self.settings.health_alert_repeat_minutes,
+            active=False,
+            active_text="",
+            payload={
+                "superseded_by": "capacity:telegram",
+                "active": active_tg,
+                "pool": tg_pool_accounts,
+            },
         )
         await self.alerts.send_stateful(
             "queue_backlog",
@@ -432,7 +446,7 @@ class Scheduler:
                     self.settings.default_poll_interval_seconds,
                 )
             )
-            capacities = await calculate_all_capacities(session, interval, self.settings)
+            capacity_plans = await calculate_all_capacity_plans(session, interval, self.settings)
 
         counts = {(platform, item_type): int(count) for platform, item_type, count in grouped}
         tg_posts = counts.get((Platform.TELEGRAM, ItemType.POST), 0)
@@ -476,17 +490,8 @@ class Scheduler:
                 "<b>Безопасная ёмкость:</b>",
             ]
         )
-        for platform, snapshot in capacities.items():
-            line = (
-                f"{platform_badge(platform)}: "
-                f"{'работает' if snapshot.allowed else 'ПАУЗА'} · "
-                f"нагрузка {snapshot.estimated_requests_per_day:,} / "
-                f"ёмкость {snapshot.safe_requests_per_day:,} ед./сутки · "
-                f"аккаунты {snapshot.account_count}/{snapshot.required_accounts}"
-            )
-            if platform == Platform.VK:
-                line += f" · IP {snapshot.proxy_ip_count}/{snapshot.required_proxy_ips}"
-            lines.append(line.replace(",", " "))
+        for plan in capacity_plans.values():
+            lines.append(capacity_plan_line(plan))
         return "\n".join(lines)
 
     async def send_daily_report_if_due(self) -> None:

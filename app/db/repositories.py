@@ -468,7 +468,8 @@ class JobRepository:
     async def schedule_due_sources(
         session: AsyncSession,
         *,
-        default_interval: int,
+        default_interval: int | None = None,
+        default_intervals: dict[Platform, int] | None = None,
         limit: int = 1000,
         allowed_platforms: set[Platform] | None = None,
     ) -> int:
@@ -499,7 +500,10 @@ class JobRepository:
                 )
             )
         for source in sources:
-            interval = source.poll_interval_seconds or default_interval
+            platform_default = (default_intervals or {}).get(source.platform, default_interval)
+            if platform_default is None:
+                continue
+            interval = source.poll_interval_seconds or platform_default
             source.next_check_at = now + timedelta(seconds=interval)
             if source.id in active_source_ids:
                 continue

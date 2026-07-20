@@ -50,7 +50,10 @@ from app.db.repositories import (
 )
 from app.db.session import SessionFactory
 from app.services.account_importer import parse_tg_accounts, parse_vk_accounts
-from app.services.capacity import calculate_all_capacities, capacity_alert_text
+from app.services.capacity import (
+    calculate_all_capacity_plans,
+    capacity_plan_line,
+)
 from app.services.credential_manager import CredentialManager
 from app.services.forum_topics import configure_signal_chat
 from app.services.importer import errors_csv, parse_source_file
@@ -883,22 +886,35 @@ async def admin_open(callback: CallbackQuery, settings: Settings) -> None:
     await callback.answer()
 
 
-async def _capacity_denial_for_interval(session, value: int, settings: Settings) -> str:
+async def _interval_plan_text(session, value: int, settings: Settings) -> str:
     if not settings.capacity_guard_enabled:
-        return ""
-    snapshots = await calculate_all_capacities(session, value, settings)
-    blocked = [snapshot for snapshot in snapshots.values() if not snapshot.allowed]
-    return "\n\n".join(capacity_alert_text(snapshot) for snapshot in blocked)
+        return f"Запрошенный интервал: <b>{value} сек.</b>"
+    plans = await calculate_all_capacity_plans(session, value, settings)
+    lines = [f"Запрошенный интервал: <b>{value} сек.</b>", ""]
+    lines.extend(capacity_plan_line(plan) for plan in plans.values())
+    restricted = [plan for plan in plans.values() if plan.restricted]
+    if restricted:
+        lines.extend(
+            [
+                "",
+                "Частота применяется отдельно к каждой платформе. "
+                "Недостаточная мощность VK не замедляет Telegram и наоборот.",
+            ]
+        )
+    return "\n".join(lines)
 
 
 async def _show_interval(callback: CallbackQuery, settings: Settings) -> None:
     async with SessionFactory() as session:
-        current = await SettingsRepository.get(
-            session, "poll_interval_seconds", settings.default_poll_interval_seconds
+        current = int(
+            await SettingsRepository.get(
+                session, "poll_interval_seconds", settings.default_poll_interval_seconds
+            )
         )
+        text = await _interval_plan_text(session, current, settings)
     await edit_or_answer(
         callback,
-        f"Текущий интервал: <b>{current} сек.</b>",
+        text,
         kb(
             [
                 [("1 мин", "admin:interval:set:60"), ("2 мин", "admin:interval:set:120")],
@@ -926,21 +942,13 @@ async def admin_interval_set(callback: CallbackQuery, settings: Settings) -> Non
         return
     async with SessionFactory() as session:
         async with session.begin():
-            denial = await _capacity_denial_for_interval(session, value, settings)
-            if not denial:
-                await SettingsRepository.set(session, "poll_interval_seconds", value)
-                await AuditRepository.write(
-                    session,
-                    _user_id(callback),
-                    "poll_interval_changed",
-                    payload={"seconds": value},
-                )
-    if denial:
-        message = callback.message
-        if isinstance(message, Message):
-            await message.answer(denial)
-        await callback.answer("Интервал небезопасен", show_alert=True)
-        return
+            await SettingsRepository.set(session, "poll_interval_seconds", value)
+            await AuditRepository.write(
+                session,
+                _user_id(callback),
+                "poll_interval_changed",
+                payload={"seconds": value},
+            )
     await callback.answer("Сохранено")
     await _show_interval(callback, settings)
 
@@ -963,14 +971,16 @@ async def admin_interval_custom_save(message: Message, state: FSMContext, settin
         return
     async with SessionFactory() as session:
         async with session.begin():
-            denial = await _capacity_denial_for_interval(session, value, settings)
-            if not denial:
-                await SettingsRepository.set(session, "poll_interval_seconds", value)
-    if denial:
-        await message.answer(denial)
-        return
+            await SettingsRepository.set(session, "poll_interval_seconds", value)
+            await AuditRepository.write(
+                session,
+                _user_id(message),
+                "poll_interval_changed",
+                payload={"seconds": value},
+            )
+        text = await _interval_plan_text(session, value, settings)
     await state.clear()
-    await message.answer(f"✅ Интервал: {value} сек.")
+    await message.answer(f"✅ Интервал сохранён.\n\n{text}")
 
 
 @router.callback_query(F.data == "admin:signal")
@@ -1300,7 +1310,7 @@ async def admin_status(callback: CallbackQuery, settings: Settings) -> None:
                 settings.default_poll_interval_seconds,
             )
         )
-        capacities = await calculate_all_capacities(session, interval, settings)
+        capacity_plans = await calculate_all_capacity_plans(session, interval, settings)
 
     def job_line(platform: str) -> str:
         pending = job_counts.get((platform, "pending"), 0)
@@ -1308,21 +1318,7 @@ async def admin_status(callback: CallbackQuery, settings: Settings) -> None:
         running = job_counts.get((platform, "running"), 0)
         return f"ожидает {pending} · повтор {retry} · выполняется {running}"
 
-    capacity_lines = "\n".join(
-        (
-            f"{platform_badge(platform)}: "
-            f"{'работает' if snapshot.allowed else 'ПАУЗА'} · "
-            f"нагрузка {snapshot.estimated_requests_per_day:,} / "
-            f"ёмкость {snapshot.safe_requests_per_day:,} ед./сутки · "
-            f"аккаунты {snapshot.account_count}/{snapshot.required_accounts}"
-            + (
-                f" · IP {snapshot.proxy_ip_count}/{snapshot.required_proxy_ips}"
-                if platform == Platform.VK
-                else ""
-            )
-        ).replace(",", " ")
-        for platform, snapshot in capacities.items()
-    )
+    capacity_lines = "\n".join(capacity_plan_line(plan) for plan in capacity_plans.values())
     text = (
         "<b>Состояние системы</b>\n\n"
         f"Источники: {total_sources}\n"
@@ -1342,6 +1338,8 @@ async def admin_status(callback: CallbackQuery, settings: Settings) -> None:
         f"cooldown {account_counts.get('telegram:cooldown', 0)} · "
         f"limited {account_counts.get('telegram:limited', 0)} · "
         f"dead {account_counts.get('telegram:dead', 0)}\n\n"
+        f"Запрошенный общий интервал: <b>{interval} сек.</b>\n"
+        f"Фактическая частота рассчитывается отдельно для каждой платформы.\n\n"
         f"<b>Безопасная ёмкость:</b>\n{capacity_lines}"
     )
     await edit_or_answer(callback, text, admin_menu())
