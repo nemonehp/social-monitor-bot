@@ -23,7 +23,9 @@ from aiogram.types import (
     FSInputFile,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    InputMediaAudio,
     InputMediaDocument,
+    InputMediaLivePhoto,
     InputMediaPhoto,
     InputMediaVideo,
 )
@@ -232,17 +234,24 @@ class DeliveryWorker:
         ]
 
     @staticmethod
-    def _input_media(row: Media):
+    def _input_media(
+        row: Media,
+        *,
+        caption: str | None = None,
+    ) -> InputMediaPhoto | InputMediaVideo | InputMediaDocument:
         file = FSInputFile(row.local_path)
+        common: dict[str, Any] = {}
+        if caption is not None:
+            common = {"caption": caption, "parse_mode": ParseMode.HTML}
         if (
             row.media_type == "photo"
             or row.media_type.endswith("preview")
             or row.media_type == "link_preview"
         ):
-            return InputMediaPhoto(media=file)
+            return InputMediaPhoto(media=file, **common)
         if row.media_type == "video":
-            return InputMediaVideo(media=file, supports_streaming=True)
-        return InputMediaDocument(media=file)
+            return InputMediaVideo(media=file, supports_streaming=True, **common)
+        return InputMediaDocument(media=file, **common)
 
     async def _thread_id(self, delivery: Delivery) -> int | None:
         if not hasattr(self, "settings"):
@@ -317,10 +326,19 @@ class DeliveryWorker:
                             )
                         message_ids.append(message.message_id)
                     else:
-                        media_group = [self._input_media(row) for row in chunk]
-                        if caption:
-                            media_group[0].caption = caption
-                            media_group[0].parse_mode = ParseMode.HTML
+                        media_group: list[
+                            InputMediaAudio
+                            | InputMediaDocument
+                            | InputMediaLivePhoto
+                            | InputMediaPhoto
+                            | InputMediaVideo
+                        ] = [
+                            self._input_media(
+                                row,
+                                caption=caption if index == 0 else None,
+                            )
+                            for index, row in enumerate(chunk)
+                        ]
                         sent = await self.bot.send_media_group(
                             delivery.target_chat_id,
                             media=media_group,
@@ -403,11 +421,19 @@ class DeliveryWorker:
             logger.warning("delivery_api_error", delivery_id=delivery.id, error=str(exc))
             return False, delay
         except Exception as exc:
-            logger.exception("delivery_unexpected", delivery_id=delivery.id)
+            # Unexpected code defects must not hot-loop every few seconds. Keep
+            # the delivery retryable so no post is lost, but apply bounded
+            # exponential backoff until the deployment is fixed.
+            delay = min(900, max(30, 2 ** min(9, max(1, delivery.attempts))))
+            logger.exception(
+                "delivery_unexpected",
+                delivery_id=delivery.id,
+                retry_in_seconds=delay,
+            )
             async with SessionFactory() as session:
                 async with session.begin():
-                    await DeliveryRepository.retry(session, delivery.id, str(exc), delay_seconds=30)
-            return False, 30
+                    await DeliveryRepository.retry(session, delivery.id, str(exc), delay_seconds=delay)
+            return False, delay
 
     async def run(self) -> None:
         if self.settings.delivery_concurrency != 1:
