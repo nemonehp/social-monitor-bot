@@ -23,7 +23,8 @@ class CredentialManager:
                         CredentialPlatform.VK,
                         account.label,
                         self.secret_box.encrypt(account.token),
-                        {},
+                        account.config,
+                        expires_at=account.expires_at,
                     )
                     created += int(is_created)
                     updated += int(not is_created)
@@ -38,7 +39,9 @@ class CredentialManager:
                         session,
                         CredentialPlatform.TELEGRAM,
                         account.label,
-                        self.secret_box.encrypt(json.dumps({"session": account.session, "api_hash": account.api_hash})),
+                        self.secret_box.encrypt(
+                            json.dumps({"session": account.session, "api_hash": account.api_hash})
+                        ),
                         {
                             "api_id": account.api_id,
                             "device_model": account.device_model,

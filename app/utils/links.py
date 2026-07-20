@@ -17,9 +17,15 @@ class NormalizedSourceLink:
 
 
 VK_DOMAINS = {
-    "vk.com", "www.vk.com", "m.vk.com",
-    "vk.ru", "www.vk.ru", "m.vk.ru",
-    "vkontakte.ru", "www.vkontakte.ru", "m.vkontakte.ru",
+    "vk.com",
+    "www.vk.com",
+    "m.vk.com",
+    "vk.ru",
+    "www.vk.ru",
+    "m.vk.ru",
+    "vkontakte.ru",
+    "www.vkontakte.ru",
+    "m.vkontakte.ru",
 }
 TG_DOMAINS = {"t.me", "www.t.me", "telegram.me", "www.telegram.me"}
 
@@ -100,13 +106,17 @@ def normalize_vk_link(raw: str) -> NormalizedSourceLink:
     if wall:
         owner_id, post_id = wall.groups()
         identifier = f"wall{owner_id}_{post_id}"
-        return NormalizedSourceLink(Platform.VK, original, f"https://vk.com/{identifier}", identifier, "wall_post")
+        return NormalizedSourceLink(
+            Platform.VK, original, f"https://vk.com/{identifier}", identifier, "wall_post"
+        )
 
     story = re.fullmatch(r"story(-?\d+)_(\d+)", lowered)
     if story:
         owner_id, story_id = story.groups()
         identifier = f"story{owner_id}_{story_id}"
-        return NormalizedSourceLink(Platform.VK, original, f"https://vk.com/{identifier}", identifier, "story")
+        return NormalizedSourceLink(
+            Platform.VK, original, f"https://vk.com/{identifier}", identifier, "story"
+        )
 
     for values in query.values():
         for value in values:
@@ -114,13 +124,19 @@ def normalize_vk_link(raw: str) -> NormalizedSourceLink:
             match = re.search(r"wall(-?\d+)_(\d+)", value)
             if match:
                 identifier = f"wall{match.group(1)}_{match.group(2)}"
-                return NormalizedSourceLink(Platform.VK, original, f"https://vk.com/{identifier}", identifier, "wall_post")
+                return NormalizedSourceLink(
+                    Platform.VK, original, f"https://vk.com/{identifier}", identifier, "wall_post"
+                )
             match = re.search(r"story(-?\d+)_(\d+)", value)
             if match:
                 identifier = f"story{match.group(1)}_{match.group(2)}"
-                return NormalizedSourceLink(Platform.VK, original, f"https://vk.com/{identifier}", identifier, "story")
+                return NormalizedSourceLink(
+                    Platform.VK, original, f"https://vk.com/{identifier}", identifier, "story"
+                )
 
-    if re.match(r"^(video|photo|market|album|audio|doc|topic|app|im|feed|friends|groups|mail|write)", lowered):
+    if re.match(
+        r"^(video|photo|market|album|audio|doc|topic|app|im|feed|friends|groups|mail|write)", lowered
+    ):
         raise ValueError("Этот тип VK-ссылки не поддерживается")
     if re.fullmatch(r"id\d+|(?:club|public|event)\d+|-?\d+", lowered):
         identifier = lowered
@@ -128,4 +144,6 @@ def normalize_vk_link(raw: str) -> NormalizedSourceLink:
         identifier = token
     else:
         raise ValueError("Не удалось разобрать VK-ссылку")
-    return NormalizedSourceLink(Platform.VK, original, f"https://vk.com/{identifier}", identifier.lower(), "profile")
+    return NormalizedSourceLink(
+        Platform.VK, original, f"https://vk.com/{identifier}", identifier.lower(), "profile"
+    )

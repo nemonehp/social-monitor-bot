@@ -54,7 +54,9 @@ class ProxyManager:
             return ProxyCheckResult(raw=raw, parsed=None, ok=False, reason=str(exc))
 
     async def check_many(self, text: str, concurrency: int = 10) -> list[ProxyCheckResult]:
-        lines = [line.strip() for line in text.splitlines() if line.strip() and not line.strip().startswith("#")]
+        lines = [
+            line.strip() for line in text.splitlines() if line.strip() and not line.strip().startswith("#")
+        ]
         semaphore = asyncio.Semaphore(concurrency)
 
         async def wrapped(line: str) -> ProxyCheckResult:

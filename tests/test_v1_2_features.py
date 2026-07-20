@@ -65,8 +65,7 @@ def test_vk_story_header_uses_platform_icon() -> None:
 def test_importer_supports_generic_categories(tmp_path: Path) -> None:
     path = tmp_path / "sources.csv"
     path.write_text(
-        "Категория;Подкатегория;Ссылка;Название\n"
-        "Проект А;Направление 1;https://t.me/example_name;Example\n",
+        "Категория;Подкатегория;Ссылка;Название\nПроект А;Направление 1;https://t.me/example_name;Example\n",
         encoding="utf-8",
     )
 

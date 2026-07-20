@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import math
 from datetime import UTC, date, datetime, time, timedelta
 from zoneinfo import ZoneInfo
 
@@ -9,6 +8,7 @@ import structlog
 from aiogram import Bot
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
+from aiogram.exceptions import TelegramAPIError
 from sqlalchemy import delete, func, select
 
 from app.config import Settings
@@ -21,7 +21,7 @@ from app.db.enums import (
     Platform,
     ProxyStatus,
 )
-from app.db.models import CollectionJob, Credential, Delivery, Item, Proxy, Source
+from app.db.models import CollectionJob, Credential, Delivery, IntegrityCheck, Item, Proxy, Source
 from app.db.repositories import (
     AccessRepository,
     CredentialRepository,
@@ -33,6 +33,7 @@ from app.db.repositories import (
 from app.db.session import SessionFactory
 from app.security import SecretBox
 from app.services.alerts import AlertService
+from app.services.capacity import calculate_all_capacities, capacity_alert_text
 from app.services.media_cleanup import cleanup_delivered_media
 from app.services.network import check_direct_ip, check_proxy, check_vk_access
 from app.utils.platforms import platform_badge
@@ -60,11 +61,11 @@ class Scheduler:
                     )
                 if await SettingsRepository.get(session, "daily_report_last_date", None) is None:
                     yesterday_msk = datetime.now(MOSCOW).date() - timedelta(days=1)
-                    await SettingsRepository.set(
-                        session, "daily_report_last_date", yesterday_msk.isoformat()
-                    )
+                    await SettingsRepository.set(session, "daily_report_last_date", yesterday_msk.isoformat())
 
     async def schedule(self) -> None:
+        snapshots = {}
+        deferred: dict[str, int] = {}
         async with SessionFactory() as session:
             async with session.begin():
                 interval = int(
@@ -76,15 +77,51 @@ class Scheduler:
                 )
                 recovered_jobs = await JobRepository.recover_expired(session)
                 recovered_deliveries = await DeliveryRepository.recover_expired(session)
+                expired_credentials = await CredentialRepository.expire_due(session)
+                allowed_platforms = {Platform.VK, Platform.TELEGRAM}
+                if self.settings.capacity_guard_enabled:
+                    snapshots = await calculate_all_capacities(session, interval, self.settings)
+                    allowed_platforms = {
+                        platform for platform, snapshot in snapshots.items() if snapshot.allowed
+                    }
+                    for platform, snapshot in snapshots.items():
+                        if not snapshot.allowed:
+                            deferred[platform.value] = await JobRepository.defer_platform(
+                                session,
+                                platform,
+                                delay_seconds=max(60, interval),
+                            )
                 created = await JobRepository.schedule_due_sources(
-                    session, default_interval=interval, limit=2000
+                    session,
+                    default_interval=interval,
+                    limit=2000,
+                    allowed_platforms=allowed_platforms,
                 )
-        if created or recovered_jobs or recovered_deliveries:
+        for platform, snapshot in snapshots.items():
+            await self.alerts.send_stateful(
+                f"capacity:{platform.value}",
+                active=not snapshot.allowed,
+                active_text=capacity_alert_text(snapshot),
+                payload={
+                    "reason": snapshot.reason,
+                    "sources": snapshot.source_count,
+                    "accounts": snapshot.account_count,
+                    "proxy_ips": snapshot.proxy_ip_count,
+                    "required_accounts": snapshot.required_accounts,
+                    "required_proxy_ips": snapshot.required_proxy_ips,
+                    "interval": interval,
+                },
+                repeat_while_active=True,
+                cooldown_minutes=self.settings.capacity_alert_repeat_minutes,
+            )
+        if created or recovered_jobs or recovered_deliveries or expired_credentials or deferred:
             logger.info(
                 "scheduler_tick",
                 created=created,
                 recovered_jobs=recovered_jobs,
                 recovered_deliveries=recovered_deliveries,
+                expired_credentials=expired_credentials,
+                deferred=deferred,
             )
 
     async def recheck_proxies(self) -> None:
@@ -151,10 +188,11 @@ class Scheduler:
     async def health_alerts(self) -> None:
         now = datetime.now(UTC)
         async with SessionFactory() as session:
-            proxy_counts = await ProxyRepository.counts(session)
             vk_pool_accounts = int(
                 await session.scalar(
-                    select(func.count()).select_from(Credential).where(
+                    select(func.count())
+                    .select_from(Credential)
+                    .where(
                         Credential.platform == CredentialPlatform.VK,
                         Credential.status.in_(
                             [
@@ -169,7 +207,9 @@ class Scheduler:
             )
             active_vk = int(
                 await session.scalar(
-                    select(func.count()).select_from(Credential).where(
+                    select(func.count())
+                    .select_from(Credential)
+                    .where(
                         Credential.platform == CredentialPlatform.VK,
                         Credential.status == CredentialStatus.ACTIVE,
                     )
@@ -178,7 +218,9 @@ class Scheduler:
             )
             active_tg = int(
                 await session.scalar(
-                    select(func.count()).select_from(Credential).where(
+                    select(func.count())
+                    .select_from(Credential)
+                    .where(
                         Credential.platform == CredentialPlatform.TELEGRAM,
                         Credential.status == CredentialStatus.ACTIVE,
                     )
@@ -187,7 +229,9 @@ class Scheduler:
             )
             tg_pool_accounts = int(
                 await session.scalar(
-                    select(func.count()).select_from(Credential).where(
+                    select(func.count())
+                    .select_from(Credential)
+                    .where(
                         Credential.platform == CredentialPlatform.TELEGRAM,
                         Credential.status.in_(
                             [
@@ -202,9 +246,9 @@ class Scheduler:
             )
             pending_jobs = int(
                 await session.scalar(
-                    select(func.count()).select_from(CollectionJob).where(
-                        CollectionJob.status.in_([JobStatus.PENDING, JobStatus.RETRY])
-                    )
+                    select(func.count())
+                    .select_from(CollectionJob)
+                    .where(CollectionJob.status.in_([JobStatus.PENDING, JobStatus.RETRY]))
                 )
                 or 0
             )
@@ -222,12 +266,27 @@ class Scheduler:
                     select(Credential.id).where(Credential.status != CredentialStatus.LIMITED)
                 )
             )
+            integrity_gaps = list(
+                await session.scalars(
+                    select(IntegrityCheck)
+                    .where(
+                        IntegrityCheck.status == "suspected_gap",
+                        IntegrityCheck.consecutive_gaps >= self.settings.integrity_gap_alert_after,
+                    )
+                    .order_by(IntegrityCheck.consecutive_gaps.desc())
+                    .limit(20)
+                )
+            )
+            expiring_credentials = list(
+                await session.scalars(
+                    select(Credential).where(
+                        Credential.status != CredentialStatus.DEAD,
+                        Credential.expires_at.is_not(None),
+                        Credential.expires_at <= now + timedelta(hours=12),
+                    )
+                )
+            )
 
-        working_proxies = proxy_counts.get("healthy", 0) + proxy_counts.get("degraded", 0)
-        proxy_threshold = max(
-            self.settings.proxy_low_watermark,
-            math.ceil(vk_pool_accounts * self.settings.proxy_low_ratio),
-        )
         try:
             direct_ip = await check_direct_ip(self.settings.ip_check_url)
             direct_is_ru = direct_ip.country_code == "RU"
@@ -245,20 +304,14 @@ class Scheduler:
         except Exception as exc:
             logger.warning("direct_ip_check_failed", error=str(exc))
 
+        # The old "half as many proxies as accounts" warning was route-count
+        # based and could contradict the exact capacity model. Clear it permanently;
+        # capacity:<platform> now reports unique-IP and 3-accounts-per-IP deficits.
         await self.alerts.send_stateful(
             "vk_proxy_low",
-            active=vk_pool_accounts > 0 and working_proxies < proxy_threshold,
-            active_text=(
-                "⚠️ <b>Недостаточно рабочих VK-прокси</b>\n\n"
-                f"Рабочих: {working_proxies}\n"
-                f"Нужно минимум: {proxy_threshold}\n"
-                f"VK-аккаунтов в пуле: {vk_pool_accounts}\n"
-                f"В карантине: {proxy_counts.get('quarantine', 0)}\n"
-                f"Удалено: {proxy_counts.get('removed', 0)}"
-            ),
-            payload={**proxy_counts, "threshold": proxy_threshold, "accounts": vk_pool_accounts},
-            repeat_while_active=True,
-            cooldown_minutes=self.settings.health_alert_repeat_minutes,
+            active=False,
+            active_text="",
+            payload={"superseded_by": "capacity:vk"},
         )
         await self.alerts.send_stateful(
             "vk_accounts_zero",
@@ -284,6 +337,34 @@ class Scheduler:
             repeat_while_active=True,
             cooldown_minutes=self.settings.health_alert_repeat_minutes,
         )
+        for gap in integrity_gaps:
+            await self.alerts.send_stateful(
+                f"integrity_gap:{gap.source_id}",
+                active=True,
+                active_text=(
+                    "⚠️ <b>Контроль полноты обнаружил возможный пропуск</b>\n\n"
+                    f"Источник ID: <code>{gap.source_id}</code>\n"
+                    f"Повторных подтверждений: {gap.consecutive_gaps}\n"
+                    "Checkpoint не продвигается; выполняется ограниченный catch-up."
+                ),
+                payload={"source_id": gap.source_id, "details": gap.details_json},
+                repeat_while_active=True,
+                cooldown_minutes=self.settings.health_alert_repeat_minutes,
+            )
+        for credential in expiring_credentials:
+            remaining = max(0, int(((credential.expires_at or now) - now).total_seconds()))
+            await self.alerts.send_stateful(
+                f"credential_expiring:{credential.id}",
+                active=True,
+                active_text=(
+                    "⚠️ <b>Срок действия VK-токена заканчивается</b>\n\n"
+                    f"Аккаунт: <code>{h(credential.label)}</code>\n"
+                    f"Осталось: {remaining // 3600} ч. {(remaining % 3600) // 60} мин.\n"
+                    "Выпустите долгоживущий токен или импортируйте новый OAuth-ответ."
+                ),
+                payload={"credential_id": credential.id, "remaining": remaining},
+                repeat_while_active=False,
+            )
         for credential in limited_rows:
             cooldown_until = credential.cooldown_until or now
             remaining = max(0, int((cooldown_until - now).total_seconds()))
@@ -344,6 +425,14 @@ class Scheduler:
             )
             credential_counts = await CredentialRepository.counts(session)
             proxy_counts = await ProxyRepository.counts(session)
+            interval = int(
+                await SettingsRepository.get(
+                    session,
+                    "poll_interval_seconds",
+                    self.settings.default_poll_interval_seconds,
+                )
+            )
+            capacities = await calculate_all_capacities(session, interval, self.settings)
 
         counts = {(platform, item_type): int(count) for platform, item_type, count in grouped}
         tg_posts = counts.get((Platform.TELEGRAM, ItemType.POST), 0)
@@ -383,8 +472,21 @@ class Scheduler:
                 f"Прокси: рабочие {proxy_counts.get('healthy', 0) + proxy_counts.get('degraded', 0)} · "
                 f"карантин {proxy_counts.get('quarantine', 0)} · "
                 f"удалено {proxy_counts.get('removed', 0)}",
+                "",
+                "<b>Безопасная ёмкость:</b>",
             ]
         )
+        for platform, snapshot in capacities.items():
+            line = (
+                f"{platform_badge(platform)}: "
+                f"{'работает' if snapshot.allowed else 'ПАУЗА'} · "
+                f"нагрузка {snapshot.estimated_requests_per_day:,} / "
+                f"ёмкость {snapshot.safe_requests_per_day:,} ед./сутки · "
+                f"аккаунты {snapshot.account_count}/{snapshot.required_accounts}"
+            )
+            if platform == Platform.VK:
+                line += f" · IP {snapshot.proxy_ip_count}/{snapshot.required_proxy_ips}"
+            lines.append(line.replace(",", " "))
         return "\n".join(lines)
 
     async def send_daily_report_if_due(self) -> None:
@@ -397,7 +499,23 @@ class Scheduler:
         if str(last_report) == report_date.isoformat():
             return
         text = await self._daily_stats(report_date)
-        if not await self.alerts.send_admin(text):
+        async with SessionFactory() as session:
+            signal_chat_id = await SettingsRepository.get(session, "signal_chat_id", None)
+            topic_map = await SettingsRepository.get(session, "signal_topic_map", {}) or {}
+        sent = False
+        if signal_chat_id and topic_map.get("statistics"):
+            try:
+                await self.bot.send_message(
+                    int(signal_chat_id),
+                    text,
+                    message_thread_id=int(topic_map["statistics"]),
+                )
+                sent = True
+            except TelegramAPIError as exc:
+                logger.warning("daily_report_topic_failed", error=str(exc))
+        if not sent:
+            sent = await self.alerts.send_admin(text)
+        if not sent:
             return
         async with SessionFactory() as session:
             async with session.begin():

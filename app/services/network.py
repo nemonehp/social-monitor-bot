@@ -17,7 +17,9 @@ class IpInfo:
 
 
 @asynccontextmanager
-async def proxy_session(proxy_url: str, timeout_seconds: int = 30) -> AsyncIterator[tuple[aiohttp.ClientSession, str | None]]:
+async def proxy_session(
+    proxy_url: str, timeout_seconds: int = 30
+) -> AsyncIterator[tuple[aiohttp.ClientSession, str | None]]:
     timeout = aiohttp.ClientTimeout(total=timeout_seconds, connect=min(15, timeout_seconds))
     if proxy_url.lower().startswith(("socks4://", "socks5://")):
         connector = ProxyConnector.from_url(proxy_url)
@@ -65,7 +67,9 @@ async def check_proxy(proxy_url: str, ip_check_url: str) -> IpInfo:
 
 async def check_vk_access(proxy_url: str) -> None:
     async with proxy_session(proxy_url) as (session, request_proxy):
-        async with session.get("https://api.vk.com/method/utils.getServerTime?v=5.131", proxy=request_proxy) as response:
+        async with session.get(
+            "https://api.vk.com/method/utils.getServerTime?v=5.131", proxy=request_proxy
+        ) as response:
             if response.status >= 500:
                 raise RuntimeError(f"VK endpoint returned HTTP {response.status}")
             data = await response.json(content_type=None)

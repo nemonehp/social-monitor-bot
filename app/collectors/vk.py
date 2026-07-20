@@ -23,7 +23,7 @@ from app.collectors.types import CollectedItem, CollectionResult, MediaPayload
 from app.config import Settings
 from app.db.enums import ItemType, Platform
 from app.db.models import Source
-from app.services.image_preview import prepare_preview
+from app.services.image_preview import decorate_video_preview, prepare_preview
 from app.services.network import proxy_session
 from app.utils.text import clean_text
 
@@ -128,7 +128,9 @@ class VkCollector:
     @staticmethod
     def _parse_owner_hint(source: Source) -> tuple[int | None, str]:
         stored_external = str(source.external_id or "").strip()
-        if stored_external and (stored_external.isdigit() or (stored_external.startswith("-") and stored_external[1:].isdigit())):
+        if stored_external and (
+            stored_external.isdigit() or (stored_external.startswith("-") and stored_external[1:].isdigit())
+        ):
             owner_id = int(stored_external)
             return owner_id, "user" if owner_id > 0 else "group"
         identifier = source.normalized_link.rstrip("/").split("/")[-1]
@@ -284,7 +286,9 @@ class VkCollector:
             return f"link:{obj.get('url')}"
         preview_urls: list[str] = []
         if kind == "photo":
-            preview_urls = [str(row.get("url") or "") for row in obj.get("sizes") or [] if isinstance(row, dict)]
+            preview_urls = [
+                str(row.get("url") or "") for row in obj.get("sizes") or [] if isinstance(row, dict)
+            ]
         elif kind == "video":
             preview_urls = [
                 str(row.get("url") or "")
@@ -311,6 +315,32 @@ class VkCollector:
                     seen.add(key)
                 result.append(attachment)
         return result
+
+    @staticmethod
+    def _owner_names(response: Any) -> dict[int, str]:
+        if not isinstance(response, dict):
+            return {}
+        result: dict[int, str] = {}
+        for group in response.get("groups") or []:
+            if isinstance(group, dict) and group.get("id"):
+                result[-int(group["id"])] = clean_text(group.get("name"))
+        for profile in response.get("profiles") or []:
+            if isinstance(profile, dict) and profile.get("id"):
+                name = clean_text(f"{profile.get('first_name', '')} {profile.get('last_name', '')}")
+                result[int(profile["id"])] = name
+        return result
+
+    @staticmethod
+    def _content_counts(attachments: Any) -> dict[str, int]:
+        counts: dict[str, int] = {}
+        if not isinstance(attachments, list):
+            return counts
+        for attachment in attachments:
+            if not isinstance(attachment, dict):
+                continue
+            kind = str(attachment.get("type") or "other")
+            counts[kind] = counts.get(kind, 0) + 1
+        return counts
 
     def _media_from_attachments(self, attachments: Any) -> list[MediaPayload]:
         result: list[MediaPayload] = []
@@ -355,6 +385,7 @@ class VkCollector:
                             preview_url=str(best.get("url") or ""),
                             width=best.get("width"),
                             height=best.get("height"),
+                            duration=int(obj.get("duration") or 0) or None,
                             metadata={
                                 "preview_only": True,
                                 "preview_candidates": self._candidate_urls(candidates),
@@ -397,11 +428,7 @@ class VkCollector:
             configured = payload.metadata.get("preview_candidates") or []
             urls = [payload.preview_url, *configured]
             urls = list(
-                dict.fromkeys(
-                    str(url)
-                    for url in urls
-                    if str(url).startswith(("http://", "https://"))
-                )
+                dict.fromkeys(str(url) for url in urls if str(url).startswith(("http://", "https://")))
             )
             for candidate_index, url in enumerate(urls):
                 try:
@@ -428,6 +455,13 @@ class VkCollector:
                         )
                         if not prepared:
                             continue
+                        if payload.media_type == "video_preview" and self.settings.video_preview_overlay:
+                            prepared = decorate_video_preview(
+                                prepared,
+                                duration=payload.duration,
+                                index=downloaded + 1,
+                                total=sum(1 for row in media if row.media_type == "video_preview"),
+                            )
                         path = target_dir / f"{downloaded:02d}.jpg"
                         await asyncio.to_thread(_write_preview, path, prepared.data)
                         payload.local_path = str(path)
@@ -496,11 +530,16 @@ class VkCollector:
                 "wall.get",
                 {
                     "owner_id": owner_id,
-                    "count": max(self.settings.vk_page_size, getattr(self.settings, "credential_health_probe_posts", 5)),
+                    "count": max(
+                        self.settings.vk_page_size, getattr(self.settings, "credential_health_probe_posts", 5)
+                    ),
                     "offset": 0,
                     "filter": "owner",
+                    "extended": 1,
                 },
             )
+            probe_response = probe_data.get("response") or {}
+            owner_names = self._owner_names(probe_response)
             probe_page = list((probe_data.get("response") or {}).get("items") or [])
             probe_posts = [post for post in probe_page if int(post.get("id") or 0)]
             content_probe_ok = bool(probe_posts)
@@ -530,9 +569,11 @@ class VkCollector:
                             "count": self.settings.vk_page_size,
                             "offset": offset,
                             "filter": "owner",
+                            "extended": 1,
                         },
                     )
                     response = data.get("response") or {}
+                    owner_names.update(self._owner_names(response))
                     page = response.get("items") or []
                 if not page:
                     found_barrier = True
@@ -609,7 +650,26 @@ class VkCollector:
                     published_at=published,
                     is_pinned=int(post.get("is_pinned") or 0) == 1,
                     media=media,
-                    raw=post,
+                    raw={
+                        **post,
+                        "monitor_repost": {
+                            "is_repost": bool(original),
+                            "owner_id": int(original.get("owner_id") or 0) if original else 0,
+                            "post_id": int(original.get("id") or 0) if original else 0,
+                            "text": clean_text(original.get("text")) if original else "",
+                            "title": owner_names.get(
+                                int(original.get("owner_id") or 0),
+                                f"VK {int(original.get('owner_id') or 0)}" if original else "",
+                            ),
+                            "url": (
+                                f"https://vk.com/wall{int(original.get('owner_id') or 0)}_"
+                                f"{int(original.get('id') or 0)}"
+                                if original
+                                else ""
+                            ),
+                        },
+                        "monitor_content_counts": self._content_counts(attachments),
+                    },
                 )
                 await self._download_images(session, request_proxy, key, media)
                 items.append(item)
@@ -659,7 +719,9 @@ class VkCollector:
 
             story_keys: list[str] = []
             known_story_keys = set(state.recent_story_keys or []) if state else set()
-            max_story_id = int(state.story_watermark or 0) if state and str(state.story_watermark).isdigit() else 0
+            max_story_id = (
+                int(state.story_watermark or 0) if state and str(state.story_watermark).isdigit() else 0
+            )
             for story in raw_stories:
                 story_owner = int(story.get("owner_id") or owner_id)
                 story_id = int(story.get("id") or 0)
@@ -670,9 +732,7 @@ class VkCollector:
                 if key in known_story_keys:
                     continue
                 published = (
-                    datetime.fromtimestamp(int(story.get("date") or 0), tz=UTC)
-                    if story.get("date")
-                    else None
+                    datetime.fromtimestamp(int(story.get("date") or 0), tz=UTC) if story.get("date") else None
                 )
                 if not published or not (window_start < published <= window_end):
                     continue
@@ -708,8 +768,10 @@ class VkCollector:
                                     "preview_only": True,
                                     "preview_candidates": self._candidate_urls(candidates),
                                 },
+                                duration=int(video.get("duration") or 0) or None,
                             )
                         )
+                story_kind = "video" if isinstance(story.get("video"), dict) else "photo"
                 item = CollectedItem(
                     platform=Platform.VK,
                     item_type=ItemType.STORY,
@@ -719,7 +781,12 @@ class VkCollector:
                     text=clean_text(story.get("text") or story.get("caption")),
                     published_at=published,
                     media=story_media,
-                    raw=story,
+                    raw={
+                        **story,
+                        "monitor_content_counts": {story_kind: 1}
+                        if story_media or story.get(story_kind)
+                        else {},
+                    },
                 )
                 await self._download_images(session, request_proxy, key, story_media)
                 items.append(item)
@@ -750,6 +817,13 @@ class VkCollector:
                 "credential_content_probe_ok": content_probe_ok,
                 "credential_known_post_match": known_probe_match,
                 "credential_probe_ids": [int(post.get("id") or 0) for post in probe_posts[:10]],
+                "api_request_count": max(2, pages + 2 + (1 if raw_stories else 0)),
+                "remote_latest_post_id": max(
+                    [int(post.get("id") or 0) for post in probe_posts] or [max_post_id]
+                ),
+                "remote_latest_story_id": max(
+                    [int(story.get("id") or 0) for story in raw_stories] or [max_story_id]
+                ),
             },
         )
 
@@ -759,8 +833,10 @@ class VkCollector:
 
         def walk(value: Any) -> None:
             if isinstance(value, dict):
-                if "id" in value and "owner_id" in value and (
-                    "date" in value or "expires_at" in value or "photo" in value or "video" in value
+                if (
+                    "id" in value
+                    and "owner_id" in value
+                    and ("date" in value or "expires_at" in value or "photo" in value or "video" in value)
                 ):
                     found.append(value)
                     return

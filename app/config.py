@@ -29,6 +29,22 @@ class Settings(BaseSettings):
     vk_max_pages_per_run: int = 20
     vk_per_token_min_interval_seconds: float = 0.35
     tg_batch_messages: int = 500
+
+    # Conservative operational budgets. Telegram and VK do not publish one fixed
+    # universal daily read limit for these methods; the guard deliberately uses
+    # only this fraction and further adapts after real FLOOD/rate-limit responses.
+    account_daily_budget_fraction: float = 0.30
+    vk_operational_daily_request_budget: int = 100_000
+    tg_operational_daily_request_budget: int = 250_000
+    vk_estimated_requests_per_source_cycle: float = 2.25
+    tg_estimated_requests_per_source_cycle: float = 2.0
+    vk_max_accounts_per_ip: int = 3
+    capacity_guard_enabled: bool = True
+    capacity_alert_repeat_minutes: int = 360
+    integrity_gap_retry_seconds: int = 15
+    integrity_gap_alert_after: int = 3
+    token_rate_limit_penalty_minutes: int = 60
+    vk_assignment_epoch_minutes: int = 60
     credential_health_probe_posts: int = 5
     collection_overlap_seconds: int = 120
     media_max_previews_per_item: int = 4
@@ -36,6 +52,7 @@ class Settings(BaseSettings):
     media_max_download_bytes: int = 12_000_000
     media_max_image_edge: int = 1600
     media_min_preview_edge: int = 320
+    video_preview_overlay: bool = True
     media_retention_hours: int = 24
     media_delete_after_delivery: bool = True
     job_history_days: int = 7

@@ -50,7 +50,9 @@ from app.db.repositories import (
 )
 from app.db.session import SessionFactory
 from app.services.account_importer import parse_tg_accounts, parse_vk_accounts
+from app.services.capacity import calculate_all_capacities, capacity_alert_text
 from app.services.credential_manager import CredentialManager
+from app.services.forum_topics import configure_signal_chat
 from app.services.importer import errors_csv, parse_source_file
 from app.services.proxy_manager import ProxyManager
 from app.utils.links import normalize_source_link
@@ -121,7 +123,7 @@ async def show_main(event: Message | CallbackQuery, settings: Settings) -> None:
 
 
 @router.message(CommandStart())
-async def start(message: Message, state: FSMContext, settings: Settings) -> None:
+async def start(message: Message, state: FSMContext, settings: Settings, bot: Bot) -> None:
     await clear_state_files(state)
     args = (message.text or "").split(maxsplit=1)
     payload = args[1] if len(args) > 1 else ""
@@ -136,16 +138,21 @@ async def start(message: Message, state: FSMContext, settings: Settings) -> None
                 if not expected or token != expected:
                     await message.answer("Ссылка подключения устарела. Создайте новую в управлении.")
                     return
-                await SettingsRepository.set(session, "signal_chat_id", message.chat.id)
-                await SettingsRepository.set(session, "signal_bind_token", "")
+        setup = await configure_signal_chat(bot, message.chat.id)
+        if not setup.ok:
+            await message.answer(setup.text)
+            return
+        async with SessionFactory() as session:
+            async with session.begin():
                 await AuditRepository.write(
                     session,
                     _user_id(message),
                     "signal_chat_bound",
                     "chat",
                     str(message.chat.id),
+                    {"topics": setup.topic_map or {}},
                 )
-        await message.answer("✅ Этот чат подключён для сигналов.")
+        await message.answer(setup.text)
         return
     await show_main(message, settings)
 
@@ -235,10 +242,12 @@ async def _source_confirm(message: Message, state: FSMContext, category_value: s
     location = " · ".join(x for x in [category, subcategory] if x) or "Без категории"
     await message.answer(
         f"<b>Добавить источник?</b>\n\n{platform}\n{h(data['normalized_link'])}\n{h(location)}",
-        reply_markup=kb([
-            [("Добавить", "source:confirm:add")],
-            [("Отмена", "source:add")],
-        ]),
+        reply_markup=kb(
+            [
+                [("Добавить", "source:confirm:add")],
+                [("Отмена", "source:add")],
+            ]
+        ),
     )
 
 
@@ -316,13 +325,13 @@ async def source_receive_file(message: Message, state: FSMContext, bot: Bot) -> 
         await message.answer(f"Ошибка чтения файла: {h(exc)}")
         return
     preview_path = temp_dir / "preview.json"
-    preview_bytes = orjson.dumps({
-        "input_rows": preview.input_rows,
-        "candidates": [
-            {**asdict(c), "platform": c.platform.value} for c in preview.candidates
-        ],
-        "errors": [asdict(e) for e in preview.errors],
-    })
+    preview_bytes = orjson.dumps(
+        {
+            "input_rows": preview.input_rows,
+            "candidates": [{**asdict(c), "platform": c.platform.value} for c in preview.candidates],
+            "errors": [asdict(e) for e in preview.errors],
+        }
+    )
     await asyncio.to_thread(preview_path.write_bytes, preview_bytes)
     await state.update_data(preview_path=str(preview_path))
     await state.set_state(AddSourceState.confirm_file)
@@ -336,10 +345,12 @@ async def source_receive_file(message: Message, state: FSMContext, bot: Bot) -> 
         f"Строк: {preview.input_rows}\n"
         f"Источников к обработке: {len(preview.candidates)}\n"
         f"Ошибок: {len(preview.errors)}",
-        reply_markup=kb([
-            [("Импортировать", "source:file:confirm")],
-            [("Отмена", "source:add")],
-        ]),
+        reply_markup=kb(
+            [
+                [("Импортировать", "source:file:confirm")],
+                [("Отмена", "source:add")],
+            ]
+        ),
     )
 
 
@@ -351,17 +362,23 @@ async def source_file_confirm(callback: CallbackQuery, state: FSMContext, settin
     created = updated = 0
     async with SessionFactory() as session:
         async with session.begin():
-            interval = int(await SettingsRepository.get(session, "poll_interval_seconds", settings.default_poll_interval_seconds))
+            interval = int(
+                await SettingsRepository.get(
+                    session, "poll_interval_seconds", settings.default_poll_interval_seconds
+                )
+            )
             candidates = payload["candidates"]
             bulk_rows = []
             now = datetime.now(UTC)
             for index, row in enumerate(candidates):
                 stagger = int(index * interval / max(1, len(candidates)))
-                bulk_rows.append({
-                    **row,
-                    "metadata": {"import_row": row.get("row_number", 0)},
-                    "next_check_at": now + timedelta(seconds=stagger),
-                })
+                bulk_rows.append(
+                    {
+                        **row,
+                        "metadata": {"import_row": row.get("row_number", 0)},
+                        "next_check_at": now + timedelta(seconds=stagger),
+                    }
+                )
             created, updated = await SourceRepository.bulk_add(
                 session,
                 bulk_rows,
@@ -465,10 +482,14 @@ async def _source_list_payload(
     for source in sources:
         code = return_code_prefix.format(page=page)
         badge = platform_badge(source.platform)
-        rows.append([(
-            f"{badge} · {_source_button_text(source)}",
-            f"source:view:{source.id}:{code}",
-        )])
+        rows.append(
+            [
+                (
+                    f"{badge} · {_source_button_text(source)}",
+                    f"source:view:{source.id}:{code}",
+                )
+            ]
+        )
     nav: list[tuple[str, str]] = []
     if page > 1:
         nav.append(("←", callback_prefix.format(page=page - 1)))
@@ -484,28 +505,40 @@ async def _source_list_payload(
 async def source_menu(callback: CallbackQuery, state: FSMContext) -> None:
     await state.set_state(None)
     async with SessionFactory() as session:
-        vk_count = int(await session.scalar(
-            select(func.count()).select_from(Source).where(
-                Source.status != SourceStatus.DELETED,
-                Source.platform == Platform.VK,
+        vk_count = int(
+            await session.scalar(
+                select(func.count())
+                .select_from(Source)
+                .where(
+                    Source.status != SourceStatus.DELETED,
+                    Source.platform == Platform.VK,
+                )
             )
-        ) or 0)
-        tg_count = int(await session.scalar(
-            select(func.count()).select_from(Source).where(
-                Source.status != SourceStatus.DELETED,
-                Source.platform == Platform.TELEGRAM,
+            or 0
+        )
+        tg_count = int(
+            await session.scalar(
+                select(func.count())
+                .select_from(Source)
+                .where(
+                    Source.status != SourceStatus.DELETED,
+                    Source.platform == Platform.TELEGRAM,
+                )
             )
-        ) or 0)
+            or 0
+        )
     await edit_or_answer(
         callback,
         f"<b>Источники</b>\n\nVK: {vk_count}\nTelegram: {tg_count}",
-        kb([
-            [("🔎 Поиск", "source:search")],
-            [("🗂 Категории", "source:districts:1")],
-            [(f"🟢 VK · алфавит ({vk_count})", "source:alpha:vk:1")],
-            [(f"🔵 TG · алфавит ({tg_count})", "source:alpha:telegram:1")],
-            [("Назад", "menu:main")],
-        ]),
+        kb(
+            [
+                [("🔎 Поиск", "source:search")],
+                [("🗂 Категории", "source:districts:1")],
+                [(f"🟢 VK · алфавит ({vk_count})", "source:alpha:vk:1")],
+                [(f"🔵 TG · алфавит ({tg_count})", "source:alpha:telegram:1")],
+                [("Назад", "menu:main")],
+            ]
+        ),
     )
     await callback.answer()
 
@@ -513,8 +546,7 @@ async def source_menu(callback: CallbackQuery, state: FSMContext) -> None:
 @router.callback_query(F.data.startswith("source:list:"))
 async def source_list_legacy(callback: CallbackQuery, state: FSMContext) -> None:
     """Keep buttons from messages sent by version 1.0 usable after upgrade."""
-    callback.data = "source:menu"
-    await source_menu(callback, state)
+    await source_menu(callback.model_copy(update={"data": "source:menu"}), state)
 
 
 @router.callback_query(F.data.startswith("source:alpha:"))
@@ -541,13 +573,16 @@ async def source_districts(callback: CallbackQuery) -> None:
         districts = await SourceRepository.category_counts(session)
     pages = max(1, math.ceil(len(districts) / SOURCE_PAGE_SIZE))
     page = min(max(1, page), pages)
-    chunk = districts[(page - 1) * SOURCE_PAGE_SIZE: page * SOURCE_PAGE_SIZE]
-    rows = [[
-        (
-            f"{_display_location(district, 'Без категории')} · {count}",
-            f"source:regions:{_location_token(district)}:1",
-        )
-    ] for district, count in chunk]
+    chunk = districts[(page - 1) * SOURCE_PAGE_SIZE : page * SOURCE_PAGE_SIZE]
+    rows = [
+        [
+            (
+                f"{_display_location(district, 'Без категории')} · {count}",
+                f"source:regions:{_location_token(district)}:1",
+            )
+        ]
+        for district, count in chunk
+    ]
     nav = []
     if page > 1:
         nav.append(("←", f"source:districts:{page - 1}"))
@@ -572,13 +607,16 @@ async def source_regions(callback: CallbackQuery) -> None:
         regions = await SourceRepository.subcategory_counts(session, district)
     pages = max(1, math.ceil(len(regions) / SOURCE_PAGE_SIZE))
     page = min(max(1, page), pages)
-    chunk = regions[(page - 1) * SOURCE_PAGE_SIZE: page * SOURCE_PAGE_SIZE]
-    rows = [[
-        (
-            f"{_display_location(region, 'Без подкатегории')} · {count}",
-            f"source:regionitems:{district_token}:{_location_token(region)}:1",
-        )
-    ] for region, count in chunk]
+    chunk = regions[(page - 1) * SOURCE_PAGE_SIZE : page * SOURCE_PAGE_SIZE]
+    rows = [
+        [
+            (
+                f"{_display_location(region, 'Без подкатегории')} · {count}",
+                f"source:regionitems:{district_token}:{_location_token(region)}:1",
+            )
+        ]
+        for region, count in chunk
+    ]
     nav = []
     if page > 1:
         nav.append(("←", f"source:regions:{district_token}:{page - 1}"))
@@ -616,10 +654,12 @@ async def source_region_items(callback: CallbackQuery) -> None:
         callback_prefix=f"source:regionitems:{district_token}:{region_token}:{{page}}",
     )
     # Replace the generic section button with a region-level back button.
-    markup.inline_keyboard[-1] = [InlineKeyboardButton(
-        text="К подкатегориям",
-        callback_data=f"source:regions:{district_token}:1",
-    )]
+    markup.inline_keyboard[-1] = [
+        InlineKeyboardButton(
+            text="К подкатегориям",
+            callback_data=f"source:regions:{district_token}:1",
+        )
+    ]
     await edit_or_answer(
         callback,
         f"<b>{h(_display_location(region, 'Без подкатегории'))}</b>\n"
@@ -721,12 +761,18 @@ async def source_view(callback: CallbackQuery) -> None:
         if source.status == SourceStatus.ACTIVE
         else ("Возобновить", f"source:resume:{source.id}:{return_code}")
     )
-    await edit_or_answer(callback, text, kb([
-        [toggle],
-        [("Изменить категорию", f"source:region:{source.id}")],
-        [("Удалить", f"source:delete:ask:{source.id}:{return_code}")],
-        [("Назад", _source_return_callback(return_code))],
-    ]))
+    await edit_or_answer(
+        callback,
+        text,
+        kb(
+            [
+                [toggle],
+                [("Изменить категорию", f"source:region:{source.id}")],
+                [("Удалить", f"source:delete:ask:{source.id}:{return_code}")],
+                [("Назад", _source_return_callback(return_code))],
+            ]
+        ),
+    )
     await callback.answer()
 
 
@@ -737,8 +783,7 @@ async def source_pause(callback: CallbackQuery) -> None:
         async with session.begin():
             await SourceRepository.set_status(session, int(source_id), SourceStatus.PAUSED)
             await AuditRepository.write(session, _user_id(callback), "source_paused", "source", source_id)
-    callback.data = f"source:view:{source_id}:{return_code}"
-    await source_view(callback)
+    await source_view(callback.model_copy(update={"data": f"source:view:{source_id}:{return_code}"}))
 
 
 @router.callback_query(F.data.startswith("source:resume:"))
@@ -748,8 +793,7 @@ async def source_resume(callback: CallbackQuery) -> None:
         async with session.begin():
             await SourceRepository.set_status(session, int(source_id), SourceStatus.ACTIVE)
             await AuditRepository.write(session, _user_id(callback), "source_resumed", "source", source_id)
-    callback.data = f"source:view:{source_id}:{return_code}"
-    await source_view(callback)
+    await source_view(callback.model_copy(update={"data": f"source:view:{source_id}:{return_code}"}))
 
 
 @router.callback_query(F.data.startswith("source:delete:ask:"))
@@ -758,10 +802,12 @@ async def source_delete_ask(callback: CallbackQuery) -> None:
     await edit_or_answer(
         callback,
         "Удалить источник из общего пула? История дедупликации сохранится.",
-        kb([
-            [("Удалить", f"source:delete:yes:{source_id}:{return_code}")],
-            [("Отмена", f"source:view:{source_id}:{return_code}")],
-        ]),
+        kb(
+            [
+                [("Удалить", f"source:delete:yes:{source_id}:{return_code}")],
+                [("Отмена", f"source:view:{source_id}:{return_code}")],
+            ]
+        ),
     )
     await callback.answer()
 
@@ -827,6 +873,7 @@ async def noop(callback: CallbackQuery) -> None:
 
 # ---------------- Admin ----------------
 
+
 @router.callback_query(F.data == "admin:menu")
 async def admin_open(callback: CallbackQuery, settings: Settings) -> None:
     if not is_admin(_user_id(callback), settings):
@@ -836,18 +883,38 @@ async def admin_open(callback: CallbackQuery, settings: Settings) -> None:
     await callback.answer()
 
 
+async def _capacity_denial_for_interval(session, value: int, settings: Settings) -> str:
+    if not settings.capacity_guard_enabled:
+        return ""
+    snapshots = await calculate_all_capacities(session, value, settings)
+    blocked = [snapshot for snapshot in snapshots.values() if not snapshot.allowed]
+    return "\n\n".join(capacity_alert_text(snapshot) for snapshot in blocked)
+
+
+async def _show_interval(callback: CallbackQuery, settings: Settings) -> None:
+    async with SessionFactory() as session:
+        current = await SettingsRepository.get(
+            session, "poll_interval_seconds", settings.default_poll_interval_seconds
+        )
+    await edit_or_answer(
+        callback,
+        f"Текущий интервал: <b>{current} сек.</b>",
+        kb(
+            [
+                [("1 мин", "admin:interval:set:60"), ("2 мин", "admin:interval:set:120")],
+                [("5 мин", "admin:interval:set:300"), ("10 мин", "admin:interval:set:600")],
+                [("Другое значение", "admin:interval:custom")],
+                [("Назад", "admin:menu")],
+            ]
+        ),
+    )
+
+
 @router.callback_query(F.data == "admin:interval")
 async def admin_interval(callback: CallbackQuery, settings: Settings) -> None:
     if not is_admin(_user_id(callback), settings):
         return
-    async with SessionFactory() as session:
-        current = await SettingsRepository.get(session, "poll_interval_seconds", settings.default_poll_interval_seconds)
-    await edit_or_answer(callback, f"Текущий интервал: <b>{current} сек.</b>", kb([
-        [("1 мин", "admin:interval:set:60"), ("2 мин", "admin:interval:set:120")],
-        [("5 мин", "admin:interval:set:300"), ("10 мин", "admin:interval:set:600")],
-        [("Другое значение", "admin:interval:custom")],
-        [("Назад", "admin:menu")],
-    ]))
+    await _show_interval(callback, settings)
     await callback.answer()
 
 
@@ -859,11 +926,23 @@ async def admin_interval_set(callback: CallbackQuery, settings: Settings) -> Non
         return
     async with SessionFactory() as session:
         async with session.begin():
-            await SettingsRepository.set(session, "poll_interval_seconds", value)
-            await AuditRepository.write(session, _user_id(callback), "poll_interval_changed", payload={"seconds": value})
+            denial = await _capacity_denial_for_interval(session, value, settings)
+            if not denial:
+                await SettingsRepository.set(session, "poll_interval_seconds", value)
+                await AuditRepository.write(
+                    session,
+                    _user_id(callback),
+                    "poll_interval_changed",
+                    payload={"seconds": value},
+                )
+    if denial:
+        message = callback.message
+        if isinstance(message, Message):
+            await message.answer(denial)
+        await callback.answer("Интервал небезопасен", show_alert=True)
+        return
     await callback.answer("Сохранено")
-    callback.data = "admin:interval"
-    await admin_interval(callback, settings)
+    await _show_interval(callback, settings)
 
 
 @router.callback_query(F.data == "admin:interval:custom")
@@ -884,7 +963,12 @@ async def admin_interval_custom_save(message: Message, state: FSMContext, settin
         return
     async with SessionFactory() as session:
         async with session.begin():
-            await SettingsRepository.set(session, "poll_interval_seconds", value)
+            denial = await _capacity_denial_for_interval(session, value, settings)
+            if not denial:
+                await SettingsRepository.set(session, "poll_interval_seconds", value)
+    if denial:
+        await message.answer(denial)
+        return
     await state.clear()
     await message.answer(f"✅ Интервал: {value} сек.")
 
@@ -898,11 +982,21 @@ async def admin_signal(callback: CallbackQuery, bot: Bot, settings: Settings) ->
             current = await SettingsRepository.get(session, "signal_chat_id", None)
             await SettingsRepository.set(session, "signal_bind_token", token)
     url = f"https://t.me/{me.username}?startgroup=bind_{token}"
-    markup = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="Подключить чат", url=url)],
-        [InlineKeyboardButton(text="Назад", callback_data="admin:menu")],
-    ])
-    await edit_or_answer(callback, f"Сейчас подключён: <code>{current or 'нет'}</code>\n\nДобавьте бота в нужную группу этой кнопкой.", markup)
+    markup = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="Подключить чат", url=url)],
+            [InlineKeyboardButton(text="Назад", callback_data="admin:menu")],
+        ]
+    )
+    await edit_or_answer(
+        callback,
+        f"Сейчас подключён: <code>{current or 'нет'}</code>\n\n"
+        "Нужна <b>супергруппа с включёнными темами</b>. Telegram не позволяет боту "
+        "самостоятельно преобразовать обычную группу: сначала сделайте это в настройках чата, "
+        "включите темы и выдайте боту права администратора с управлением темами. Затем добавьте "
+        "бота этой кнопкой — он создаст пять служебных тем автоматически.",
+        markup,
+    )
     await callback.answer()
 
 
@@ -915,7 +1009,11 @@ async def admin_proxies(callback: CallbackQuery) -> None:
 @router.callback_query(F.data == "admin:proxy:add")
 async def admin_proxy_add(callback: CallbackQuery, state: FSMContext) -> None:
     await state.set_state(AdminState.waiting_proxy_input)
-    await edit_or_answer(callback, "Отправьте прокси строками или TXT-файлом. Поддерживаются HTTP(S), SOCKS4/5 и форматы host:port[:user:pass].", kb([[("Отмена", "admin:proxies")]]))
+    await edit_or_answer(
+        callback,
+        "Отправьте прокси строками или TXT-файлом. Поддерживаются HTTP(S), SOCKS4/5 и форматы host:port[:user:pass].",
+        kb([[("Отмена", "admin:proxies")]]),
+    )
     await callback.answer()
 
 
@@ -930,7 +1028,11 @@ async def _proxy_input_text(message: Message, text: str, state: FSMContext, sett
                 session,
                 _user_id(message),
                 "vk_proxies_imported",
-                payload={"created": created, "updated": updated, "failed": len([r for r in results if not r.ok])},
+                payload={
+                    "created": created,
+                    "updated": updated,
+                    "failed": len([r for r in results if not r.ok]),
+                },
             )
     failed = [r for r in results if not r.ok]
     details = "\n".join(f"• {h(r.raw[:60])}: {h(r.reason)}" for r in failed[:10])
@@ -939,8 +1041,7 @@ async def _proxy_input_text(message: Message, text: str, state: FSMContext, sett
         f"Рабочих RU: {created + updated}\n"
         f"Добавлено: {created}\n"
         f"Обновлено: {updated}\n"
-        f"Отклонено: {len(failed)}"
-        + (f"\n\n{details}" if details else ""),
+        f"Отклонено: {len(failed)}" + (f"\n\n{details}" if details else ""),
         reply_markup=proxy_menu(),
     )
     await state.clear()
@@ -963,7 +1064,11 @@ async def admin_proxy_file(message: Message, state: FSMContext, bot: Bot, settin
 async def admin_proxy_status(callback: CallbackQuery) -> None:
     async with SessionFactory() as session:
         counts = await ProxyRepository.counts(session)
-    await edit_or_answer(callback, "<b>Пул VK-прокси</b>\n\n" + "\n".join(f"{h(k)}: {v}" for k, v in counts.items()), proxy_menu())
+    await edit_or_answer(
+        callback,
+        "<b>Пул VK-прокси</b>\n\n" + "\n".join(f"{h(k)}: {v}" for k, v in counts.items()),
+        proxy_menu(),
+    )
     await callback.answer()
 
 
@@ -976,7 +1081,11 @@ async def admin_accounts(callback: CallbackQuery) -> None:
 @router.callback_query(F.data == "admin:accounts:vk")
 async def admin_accounts_vk(callback: CallbackQuery, state: FSMContext) -> None:
     await state.set_state(AdminState.waiting_vk_accounts)
-    await edit_or_answer(callback, "Отправьте VK-токены по одному на строку. Допустимо: label;token", kb([[("Отмена", "admin:accounts")]]))
+    await edit_or_answer(
+        callback,
+        "Отправьте VK-токены по одному на строку. Допустимо: label;token",
+        kb([[("Отмена", "admin:accounts")]]),
+    )
     await callback.answer()
 
 
@@ -986,9 +1095,17 @@ async def admin_accounts_vk_save(message: Message, state: FSMContext, settings: 
     created, updated = await CredentialManager(settings.app_encryption_key).save_vk(accounts)
     async with SessionFactory() as session:
         async with session.begin():
-            await AuditRepository.write(session, _user_id(message), "vk_accounts_imported", payload={"created": created, "updated": updated, "errors": len(errors)})
+            await AuditRepository.write(
+                session,
+                _user_id(message),
+                "vk_accounts_imported",
+                payload={"created": created, "updated": updated, "errors": len(errors)},
+            )
     await state.clear()
-    await message.answer(f"VK-токены: добавлено {created}, обновлено {updated}, ошибок {len(errors)}", reply_markup=accounts_menu())
+    await message.answer(
+        f"VK-токены: добавлено {created}, обновлено {updated}, ошибок {len(errors)}",
+        reply_markup=accounts_menu(),
+    )
 
 
 @router.message(AdminState.waiting_vk_accounts, F.document)
@@ -999,15 +1116,27 @@ async def admin_accounts_vk_file(message: Message, state: FSMContext, bot: Bot, 
     created, updated = await CredentialManager(settings.app_encryption_key).save_vk(accounts)
     async with SessionFactory() as session:
         async with session.begin():
-            await AuditRepository.write(session, _user_id(message), "vk_accounts_imported", payload={"created": created, "updated": updated, "errors": len(errors)})
+            await AuditRepository.write(
+                session,
+                _user_id(message),
+                "vk_accounts_imported",
+                payload={"created": created, "updated": updated, "errors": len(errors)},
+            )
     await state.clear()
-    await message.answer(f"VK-токены: добавлено {created}, обновлено {updated}, ошибок {len(errors)}", reply_markup=accounts_menu())
+    await message.answer(
+        f"VK-токены: добавлено {created}, обновлено {updated}, ошибок {len(errors)}",
+        reply_markup=accounts_menu(),
+    )
 
 
 @router.callback_query(F.data == "admin:accounts:tg")
 async def admin_accounts_tg(callback: CallbackQuery, state: FSMContext) -> None:
     await state.set_state(AdminState.waiting_tg_accounts)
-    await edit_or_answer(callback, "Отправьте строки Telegram-аккаунтов в вашем существующем CSV-формате из 10 полей.", kb([[("Отмена", "admin:accounts")]]))
+    await edit_or_answer(
+        callback,
+        "Отправьте строки Telegram-аккаунтов в вашем существующем CSV-формате из 10 полей.",
+        kb([[("Отмена", "admin:accounts")]]),
+    )
     await callback.answer()
 
 
@@ -1017,9 +1146,17 @@ async def admin_accounts_tg_save(message: Message, state: FSMContext, settings: 
     created, updated = await CredentialManager(settings.app_encryption_key).save_tg(accounts)
     async with SessionFactory() as session:
         async with session.begin():
-            await AuditRepository.write(session, _user_id(message), "tg_accounts_imported", payload={"created": created, "updated": updated, "errors": len(errors)})
+            await AuditRepository.write(
+                session,
+                _user_id(message),
+                "tg_accounts_imported",
+                payload={"created": created, "updated": updated, "errors": len(errors)},
+            )
     await state.clear()
-    await message.answer(f"TG-сессии: добавлено {created}, обновлено {updated}, ошибок {len(errors)}", reply_markup=accounts_menu())
+    await message.answer(
+        f"TG-сессии: добавлено {created}, обновлено {updated}, ошибок {len(errors)}",
+        reply_markup=accounts_menu(),
+    )
 
 
 @router.message(AdminState.waiting_tg_accounts, F.document)
@@ -1030,16 +1167,28 @@ async def admin_accounts_tg_file(message: Message, state: FSMContext, bot: Bot, 
     created, updated = await CredentialManager(settings.app_encryption_key).save_tg(accounts)
     async with SessionFactory() as session:
         async with session.begin():
-            await AuditRepository.write(session, _user_id(message), "tg_accounts_imported", payload={"created": created, "updated": updated, "errors": len(errors)})
+            await AuditRepository.write(
+                session,
+                _user_id(message),
+                "tg_accounts_imported",
+                payload={"created": created, "updated": updated, "errors": len(errors)},
+            )
     await state.clear()
-    await message.answer(f"TG-сессии: добавлено {created}, обновлено {updated}, ошибок {len(errors)}", reply_markup=accounts_menu())
+    await message.answer(
+        f"TG-сессии: добавлено {created}, обновлено {updated}, ошибок {len(errors)}",
+        reply_markup=accounts_menu(),
+    )
 
 
 @router.callback_query(F.data == "admin:accounts:status")
 async def admin_accounts_status(callback: CallbackQuery) -> None:
     async with SessionFactory() as session:
         counts = await CredentialRepository.counts(session)
-    await edit_or_answer(callback, "<b>Состояние аккаунтов</b>\n\n" + "\n".join(f"{h(k)}: {v}" for k, v in counts.items()), accounts_menu())
+    await edit_or_answer(
+        callback,
+        "<b>Состояние аккаунтов</b>\n\n" + "\n".join(f"{h(k)}: {v}" for k, v in counts.items()),
+        accounts_menu(),
+    )
     await callback.answer()
 
 
@@ -1097,31 +1246,83 @@ async def admin_access_disable(callback: CallbackQuery, settings: Settings) -> N
         async with session.begin():
             await AccessRepository.disable_user(session, user_id)
             await AuditRepository.write(session, _user_id(callback), "user_disabled", "user", str(user_id))
-    callback.data = "admin:access:list"
-    await admin_access_list(callback, settings)
+    await admin_access_list(callback.model_copy(update={"data": "admin:access:list"}), settings)
 
 
 @router.callback_query(F.data == "admin:status")
-async def admin_status(callback: CallbackQuery) -> None:
+async def admin_status(callback: CallbackQuery, settings: Settings) -> None:
     async with SessionFactory() as session:
-        source_counts = dict((p.value, int(c)) for p, c in (await session.execute(select(Source.platform, func.count()).where(Source.status == SourceStatus.ACTIVE).group_by(Source.platform))).all())
-        total_sources = int(await session.scalar(select(func.count()).select_from(Source).where(Source.status != SourceStatus.DELETED)) or 0)
-        errors = int(await session.scalar(select(func.count()).select_from(Source).where(Source.status == SourceStatus.ERROR)) or 0)
-        job_rows = (await session.execute(
-            select(CollectionJob.platform, CollectionJob.status, func.count())
-            .where(CollectionJob.status.in_([JobStatus.PENDING, JobStatus.RETRY, JobStatus.RUNNING]))
-            .group_by(CollectionJob.platform, CollectionJob.status)
-        )).all()
+        source_counts = dict(
+            (p.value, int(c))
+            for p, c in (
+                await session.execute(
+                    select(Source.platform, func.count())
+                    .where(Source.status == SourceStatus.ACTIVE)
+                    .group_by(Source.platform)
+                )
+            ).all()
+        )
+        total_sources = int(
+            await session.scalar(
+                select(func.count()).select_from(Source).where(Source.status != SourceStatus.DELETED)
+            )
+            or 0
+        )
+        errors = int(
+            await session.scalar(
+                select(func.count()).select_from(Source).where(Source.status == SourceStatus.ERROR)
+            )
+            or 0
+        )
+        job_rows = (
+            await session.execute(
+                select(CollectionJob.platform, CollectionJob.status, func.count())
+                .where(CollectionJob.status.in_([JobStatus.PENDING, JobStatus.RETRY, JobStatus.RUNNING]))
+                .group_by(CollectionJob.platform, CollectionJob.status)
+            )
+        ).all()
         job_counts = {(platform.value, status.value): int(count) for platform, status, count in job_rows}
         pending_jobs = sum(job_counts.values())
-        pending_deliveries = int(await session.scalar(select(func.count()).select_from(Delivery).where(Delivery.status.in_([DeliveryStatus.PENDING, DeliveryStatus.RETRY]))) or 0)
+        pending_deliveries = int(
+            await session.scalar(
+                select(func.count())
+                .select_from(Delivery)
+                .where(Delivery.status.in_([DeliveryStatus.PENDING, DeliveryStatus.RETRY]))
+            )
+            or 0
+        )
         proxy_counts = await ProxyRepository.counts(session)
         account_counts = await CredentialRepository.counts(session)
+        interval = int(
+            await SettingsRepository.get(
+                session,
+                "poll_interval_seconds",
+                settings.default_poll_interval_seconds,
+            )
+        )
+        capacities = await calculate_all_capacities(session, interval, settings)
+
     def job_line(platform: str) -> str:
         pending = job_counts.get((platform, "pending"), 0)
         retry = job_counts.get((platform, "retry"), 0)
         running = job_counts.get((platform, "running"), 0)
         return f"ожидает {pending} · повтор {retry} · выполняется {running}"
+
+    capacity_lines = "\n".join(
+        (
+            f"{platform_badge(platform)}: "
+            f"{'работает' if snapshot.allowed else 'ПАУЗА'} · "
+            f"нагрузка {snapshot.estimated_requests_per_day:,} / "
+            f"ёмкость {snapshot.safe_requests_per_day:,} ед./сутки · "
+            f"аккаунты {snapshot.account_count}/{snapshot.required_accounts}"
+            + (
+                f" · IP {snapshot.proxy_ip_count}/{snapshot.required_proxy_ips}"
+                if platform == Platform.VK
+                else ""
+            )
+        ).replace(",", " ")
+        for platform, snapshot in capacities.items()
+    )
     text = (
         "<b>Состояние системы</b>\n\n"
         f"Источники: {total_sources}\n"
@@ -1140,7 +1341,8 @@ async def admin_status(callback: CallbackQuery) -> None:
         f"Telegram-аккаунты: active {account_counts.get('telegram:active', 0)} · "
         f"cooldown {account_counts.get('telegram:cooldown', 0)} · "
         f"limited {account_counts.get('telegram:limited', 0)} · "
-        f"dead {account_counts.get('telegram:dead', 0)}"
+        f"dead {account_counts.get('telegram:dead', 0)}\n\n"
+        f"<b>Безопасная ёмкость:</b>\n{capacity_lines}"
     )
     await edit_or_answer(callback, text, admin_menu())
     await callback.answer()

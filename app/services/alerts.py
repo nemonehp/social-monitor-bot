@@ -48,9 +48,7 @@ class AlertService:
                     active=active,
                     payload=payload,
                     cooldown_minutes=(
-                        self.settings.alert_cooldown_minutes
-                        if cooldown_minutes is None
-                        else cooldown_minutes
+                        self.settings.alert_cooldown_minutes if cooldown_minutes is None else cooldown_minutes
                     ),
                     repeat_while_active=repeat_while_active,
                     send_recovery=send_recovery,

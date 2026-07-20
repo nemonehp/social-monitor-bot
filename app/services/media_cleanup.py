@@ -45,11 +45,13 @@ async def cleanup_delivered_media(retention_hours: int, limit: int = 1000) -> in
                         ~exists(
                             select(Delivery.id).where(
                                 Delivery.item_id == Media.item_id,
-                                Delivery.status.in_([
-                                    DeliveryStatus.PENDING,
-                                    DeliveryStatus.RUNNING,
-                                    DeliveryStatus.RETRY,
-                                ]),
+                                Delivery.status.in_(
+                                    [
+                                        DeliveryStatus.PENDING,
+                                        DeliveryStatus.RUNNING,
+                                        DeliveryStatus.RETRY,
+                                    ]
+                                ),
                             )
                         ),
                     )
@@ -75,20 +77,20 @@ async def cleanup_item_media(item_id: int) -> int:
                 select(
                     exists().where(
                         Delivery.item_id == item_id,
-                        Delivery.status.in_([
-                            DeliveryStatus.PENDING,
-                            DeliveryStatus.RUNNING,
-                            DeliveryStatus.RETRY,
-                        ]),
+                        Delivery.status.in_(
+                            [
+                                DeliveryStatus.PENDING,
+                                DeliveryStatus.RUNNING,
+                                DeliveryStatus.RETRY,
+                            ]
+                        ),
                     )
                 )
             )
             if outstanding:
                 return 0
             rows = list(
-                await session.scalars(
-                    select(Media).where(Media.item_id == item_id, Media.local_path != "")
-                )
+                await session.scalars(select(Media).where(Media.item_id == item_id, Media.local_path != ""))
             )
             deleted_paths = await asyncio.to_thread(
                 _delete_files,

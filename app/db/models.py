@@ -1,11 +1,12 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from typing import Any
 
 from sqlalchemy import (
     BigInteger,
     Boolean,
+    Date,
     DateTime,
     Enum,
     ForeignKey,
@@ -84,7 +85,9 @@ class Source(Base, TimestampMixin):
     last_error_text: Mapped[str] = mapped_column(Text, default="", nullable=False)
     metadata_json: Mapped[dict[str, Any]] = mapped_column(JSONB, default=dict, nullable=False)
 
-    state: Mapped[SourceState] = relationship(back_populates="source", uselist=False, cascade="all, delete-orphan")
+    state: Mapped[SourceState] = relationship(
+        back_populates="source", uselist=False, cascade="all, delete-orphan"
+    )
     items: Mapped[list[Item]] = relationship(back_populates="source")
 
 
@@ -115,7 +118,9 @@ class CollectionJob(Base, TimestampMixin):
     )
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
-    source_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("sources.id", ondelete="CASCADE"), nullable=False)
+    source_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("sources.id", ondelete="CASCADE"), nullable=False
+    )
     platform: Mapped[Platform] = mapped_column(Enum(Platform, name="job_platform_enum"), nullable=False)
     status: Mapped[JobStatus] = mapped_column(
         Enum(JobStatus, name="job_status_enum"), default=JobStatus.PENDING, nullable=False
@@ -135,7 +140,9 @@ class Item(Base, TimestampMixin):
     )
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
-    source_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("sources.id", ondelete="CASCADE"), nullable=False)
+    source_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("sources.id", ondelete="CASCADE"), nullable=False
+    )
     platform: Mapped[Platform] = mapped_column(Enum(Platform, name="item_platform_enum"), nullable=False)
     item_type: Mapped[ItemType] = mapped_column(Enum(ItemType, name="item_type_enum"), nullable=False)
     item_key: Mapped[str] = mapped_column(String(500), nullable=False)
@@ -156,7 +163,9 @@ class Media(Base, TimestampMixin):
     __table_args__ = (Index("ix_media_item_order", "item_id", "position"),)
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
-    item_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("items.id", ondelete="CASCADE"), nullable=False)
+    item_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("items.id", ondelete="CASCADE"), nullable=False
+    )
     position: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     media_type: Mapped[str] = mapped_column(String(50), nullable=False)
     remote_url: Mapped[str] = mapped_column(Text, default="", nullable=False)
@@ -180,7 +189,9 @@ class Delivery(Base, TimestampMixin):
     )
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
-    item_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("items.id", ondelete="CASCADE"), nullable=False)
+    item_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("items.id", ondelete="CASCADE"), nullable=False
+    )
     target_chat_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
     status: Mapped[DeliveryStatus] = mapped_column(
         Enum(DeliveryStatus, name="delivery_status_enum"), default=DeliveryStatus.PENDING, nullable=False
@@ -199,6 +210,7 @@ class Credential(Base, TimestampMixin):
     __table_args__ = (
         UniqueConstraint("platform", "label", name="uq_credentials_platform_label"),
         Index("ix_credentials_available", "platform", "status", "cooldown_until"),
+        Index("ix_credentials_assigned_proxy", "assigned_proxy_id"),
     )
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
@@ -220,6 +232,14 @@ class Credential(Base, TimestampMixin):
     health_failures: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     dead_since: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     dead_notified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    assigned_proxy_id: Mapped[int | None] = mapped_column(
+        BigInteger, ForeignKey("proxies.id", ondelete="SET NULL"), nullable=True
+    )
+    assigned_external_ip: Mapped[str] = mapped_column(String(100), default="", nullable=False)
+    assignment_epoch: Mapped[str] = mapped_column(String(64), default="", nullable=False)
+    rate_limit_events: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    last_rate_limit_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
 class Proxy(Base, TimestampMixin):
@@ -246,6 +266,40 @@ class Proxy(Base, TimestampMixin):
     last_success_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     quarantine_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     last_error: Mapped[str] = mapped_column(Text, default="", nullable=False)
+
+
+class ApiUsage(Base, TimestampMixin):
+    __tablename__ = "api_usage"
+    __table_args__ = (
+        UniqueConstraint("credential_id", "usage_date", name="uq_api_usage_credential_date"),
+        Index("ix_api_usage_platform_date", "platform", "usage_date"),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    credential_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("credentials.id", ondelete="CASCADE"), nullable=False
+    )
+    platform: Mapped[str] = mapped_column(String(20), nullable=False)
+    usage_date: Mapped[date] = mapped_column(Date, nullable=False)
+    request_count: Mapped[int] = mapped_column(BigInteger, default=0, nullable=False)
+    source_checks: Mapped[int] = mapped_column(BigInteger, default=0, nullable=False)
+    rate_limit_events: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+
+
+class IntegrityCheck(Base, TimestampMixin):
+    __tablename__ = "integrity_checks"
+
+    source_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("sources.id", ondelete="CASCADE"), primary_key=True
+    )
+    last_checked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_remote_post_id: Mapped[str] = mapped_column(String(255), default="", nullable=False)
+    last_remote_story_id: Mapped[str] = mapped_column(String(255), default="", nullable=False)
+    last_stored_post_id: Mapped[str] = mapped_column(String(255), default="", nullable=False)
+    last_stored_story_id: Mapped[str] = mapped_column(String(255), default="", nullable=False)
+    status: Mapped[str] = mapped_column(String(50), default="unknown", nullable=False)
+    consecutive_gaps: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    details_json: Mapped[dict[str, Any]] = mapped_column(JSONB, default=dict, nullable=False)
 
 
 class AuditLog(Base):

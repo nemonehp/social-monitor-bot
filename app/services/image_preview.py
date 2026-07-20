@@ -88,3 +88,63 @@ def prepare_preview(
         )
         image = image.resize(next_size, Image.Resampling.LANCZOS)
     return None
+
+
+def decorate_video_preview(
+    preview: PreparedPreview,
+    *,
+    duration: int | None = None,
+    index: int | None = None,
+    total: int | None = None,
+) -> PreparedPreview:
+    """Add a familiar play affordance without pretending the JPEG is playable."""
+    from PIL import ImageDraw, ImageFont
+
+    try:
+        with Image.open(BytesIO(preview.data)) as opened:
+            image = opened.convert("RGB")
+    except (OSError, UnidentifiedImageError):
+        return preview
+    draw = ImageDraw.Draw(image, "RGBA")
+    width, height = image.size
+    radius = max(24, min(width, height) // 9)
+    cx, cy = width // 2, height // 2
+    draw.ellipse(
+        (cx - radius, cy - radius, cx + radius, cy + radius),
+        fill=(0, 0, 0, 145),
+        outline=(255, 255, 255, 215),
+        width=max(2, radius // 14),
+    )
+    triangle = [
+        (cx - radius // 3, cy - radius // 2),
+        (cx - radius // 3, cy + radius // 2),
+        (cx + radius // 2, cy),
+    ]
+    draw.polygon(triangle, fill=(255, 255, 255, 245))
+
+    labels: list[str] = []
+    if duration and duration > 0:
+        minutes, seconds = divmod(duration, 60)
+        labels.append(f"{minutes}:{seconds:02d}")
+    if index and total and total > 1:
+        labels.append(f"{index}/{total}")
+    label = " · ".join(labels)
+    if label:
+        font = ImageFont.load_default(size=max(12, min(width, height) // 25))
+        box = draw.textbbox((0, 0), label, font=font)
+        text_w = box[2] - box[0]
+        text_h = box[3] - box[1]
+        pad = max(6, text_h // 3)
+        x = width - text_w - pad * 2 - max(8, width // 50)
+        y = height - text_h - pad * 2 - max(8, height // 50)
+        draw.rounded_rectangle(
+            (x, y, x + text_w + pad * 2, y + text_h + pad * 2),
+            radius=pad,
+            fill=(0, 0, 0, 170),
+        )
+        draw.text((x + pad, y + pad), label, font=font, fill=(255, 255, 255, 255))
+
+    output = BytesIO()
+    image.save(output, format="JPEG", quality=90, optimize=True, progressive=True)
+    data = output.getvalue()
+    return PreparedPreview(data=data, width=width, height=height)

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import socket
+from datetime import UTC, datetime, timedelta
 
 import structlog
 from aiogram import Bot
@@ -26,6 +27,7 @@ from app.db.repositories import CredentialRepository, JobRepository, SourceRepos
 from app.db.session import SessionFactory
 from app.security import SecretBox
 from app.services.alerts import AlertService
+from app.services.capacity import adaptive_account_budget, record_api_usage, usage_today
 from app.services.network import check_direct_ip
 from app.workers.common import keep_job_lease, persist_collection_result
 
@@ -91,6 +93,30 @@ class TgWorker:
                 try:
                     async with SessionFactory() as session:
                         async with session.begin():
+                            fresh_credential = await session.get(Credential, credential.id)
+                            if fresh_credential is None:
+                                return
+                            used = await usage_today(session, credential.id)
+                            budget = adaptive_account_budget(
+                                Platform.TELEGRAM,
+                                self.settings,
+                                fresh_credential.rate_limit_events,
+                            )
+                            if used >= budget:
+                                now = datetime.now(UTC)
+                                tomorrow = (now + timedelta(days=1)).replace(
+                                    hour=0, minute=0, second=5, microsecond=0
+                                )
+                                await CredentialRepository.pause_for_budget(
+                                    session, credential.id, int((tomorrow - now).total_seconds())
+                                )
+                                logger.warning(
+                                    "tg_daily_budget_exhausted",
+                                    credential_id=credential.id,
+                                    used=used,
+                                    budget=budget,
+                                )
+                                return
                             job = await JobRepository.claim(
                                 session,
                                 platform=Platform.TELEGRAM,
@@ -116,10 +142,20 @@ class TgWorker:
                                 if not source:
                                     await JobRepository.complete(session, job.id)
                                     continue
-                                inserted, deliveries = await persist_collection_result(session, source, result)
+                                inserted, deliveries = await persist_collection_result(
+                                    session, source, result
+                                )
+                                request_count = max(1, int(result.diagnostics.get("api_request_count") or 1))
+                                await record_api_usage(
+                                    session,
+                                    credential_id=credential.id,
+                                    platform=Platform.TELEGRAM,
+                                    request_count=request_count,
+                                )
                                 await CredentialRepository.mark_success(
                                     session,
                                     credential.id,
+                                    request_count=request_count,
                                     health_verified=bool(
                                         result.diagnostics.get("credential_content_probe_ok")
                                     ),
@@ -129,7 +165,11 @@ class TgWorker:
                                         session,
                                         job.id,
                                         "continuing bounded Telegram scan",
-                                        delay_seconds=1,
+                                        delay_seconds=(
+                                            self.settings.integrity_gap_retry_seconds
+                                            if result.diagnostics.get("integrity_status") == "suspected_gap"
+                                            else 1
+                                        ),
                                     )
                                 else:
                                     await JobRepository.complete(session, job.id)
@@ -144,12 +184,20 @@ class TgWorker:
                     delay = max(5, exc.retry_after)
                     async with SessionFactory() as session:
                         async with session.begin():
+                            await record_api_usage(
+                                session,
+                                credential_id=credential.id,
+                                platform=Platform.TELEGRAM,
+                                request_count=1,
+                                rate_limit_events=1,
+                            )
                             await CredentialRepository.cooldown(
                                 session,
                                 credential.id,
                                 delay,
                                 str(exc),
                                 limited=delay >= self.settings.limited_alert_threshold_seconds,
+                                rate_limited=True,
                             )
                             if job_id:
                                 await JobRepository.retry(session, job_id, str(exc), delay_seconds=delay)
@@ -176,12 +224,16 @@ class TgWorker:
                                     final=final,
                                 )
                                 if source:
-                                    await SourceRepository.update_after_error(session, source.id, exc.code, str(exc))
+                                    await SourceRepository.update_after_error(
+                                        session, source.id, exc.code, str(exc)
+                                    )
                     logger.warning("tg_retryable_error", job_id=job_id, error=str(exc))
                 except AccessDeniedError as exc:
                     async with SessionFactory() as session:
                         async with session.begin():
-                            final = bool(job and job.attempts >= self.settings.max_credential_tries_per_source)
+                            final = bool(
+                                job and job.attempts >= self.settings.max_credential_tries_per_source
+                            )
                             if job_id:
                                 if final:
                                     await JobRepository.complete(session, job_id)
@@ -258,9 +310,7 @@ class TgWorker:
                     )
                 for index, credential in enumerate(credentials):
                     if credential.id not in tasks:
-                        tasks[credential.id] = asyncio.create_task(
-                            self.account_loop(credential, index + 1)
-                        )
+                        tasks[credential.id] = asyncio.create_task(self.account_loop(credential, index + 1))
                 if not tasks:
                     logger.warning("no_telegram_accounts")
                 await asyncio.sleep(15)

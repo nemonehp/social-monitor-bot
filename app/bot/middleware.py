@@ -42,9 +42,7 @@ class AllowlistMiddleware(BaseMiddleware):
         if user is None:
             return await handler(event, data)
         async with SessionFactory() as session:
-            allowed = await AccessRepository.is_allowed(
-                session, user.id, self.settings.admin_telegram_id
-            )
+            allowed = await AccessRepository.is_allowed(session, user.id, self.settings.admin_telegram_id)
         if allowed:
             await self._ensure_persistent_menu(event)
             if (

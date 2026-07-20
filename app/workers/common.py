@@ -12,6 +12,7 @@ from app.collectors.types import CollectionResult
 from app.db.models import Source
 from app.db.repositories import ItemRepository, JobRepository, SettingsRepository, SourceRepository
 from app.db.session import SessionFactory
+from app.services.integrity import assess_collection_integrity
 
 logger = structlog.get_logger()
 
@@ -83,6 +84,20 @@ async def persist_collection_result(
         items=eligible,
         signal_chat_id=int(signal_chat_id) if signal_chat_id else None,
     )
+    await session.flush()
+    integrity = await assess_collection_integrity(session, source, result)
+    if integrity.suspected_gap:
+        result.needs_immediate_retry = True
+        result.diagnostics["integrity_status"] = integrity.status
+        result.diagnostics["integrity_details"] = integrity.details
+        logger.warning(
+            "collection_integrity_gap",
+            source_id=source.id,
+            platform=source.platform.value,
+            details=integrity.details,
+        )
+    else:
+        result.diagnostics["integrity_status"] = "ok"
     post_keys = [item.item_key for item in eligible if item.item_type.value == "post"]
     story_keys = [item.item_key for item in eligible if item.item_type.value == "story"]
 
@@ -90,13 +105,21 @@ async def persist_collection_result(
     was_bootstrap = not source.state or not source.state.bootstrap_completed
     bootstrap_completed = True if was_bootstrap and collection_completed else None
     checkpoint_at = result.window_end if collection_completed else None
+
+    # A committed watermark must never jump across an unfinished VK pagination or
+    # a suspected integrity gap. The collector cursor keeps the candidate high-water
+    # mark until the missing pages are safely traversed. Telegram incremental batches
+    # may advance their committed min_id because each completed batch is contiguous.
+    integrity_gap = integrity.suspected_gap
+    hold_post_watermark = integrity_gap or (source.platform.value == "vk" and bool(result.post_cursor))
+    hold_story_watermark = integrity_gap or bool(result.story_cursor)
     await ItemRepository.update_state(
         session,
         source.id,
         bootstrap_completed=bootstrap_completed,
         checkpoint_at=checkpoint_at,
-        post_watermark=result.post_watermark,
-        story_watermark=result.story_watermark,
+        post_watermark=None if hold_post_watermark else result.post_watermark,
+        story_watermark=None if hold_story_watermark else result.story_watermark,
         post_cursor=result.post_cursor,
         story_cursor=result.story_cursor,
         recent_post_keys=(source.state.recent_post_keys if source.state else []) + post_keys,

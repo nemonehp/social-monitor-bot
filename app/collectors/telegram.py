@@ -21,23 +21,43 @@ from app.collectors.types import CollectedItem, CollectionResult, MediaPayload
 from app.config import Settings
 from app.db.enums import ItemType, Platform
 from app.db.models import Source
-from app.services.image_preview import PreparedPreview, prepare_preview
+from app.services.image_preview import PreparedPreview, decorate_video_preview, prepare_preview
 from app.utils.text import clean_text
 
 BAD_SESSION_ERRORS = {
-    "AuthKeyUnregisteredError", "AuthKeyInvalidError", "AuthKeyDuplicatedError",
-    "SessionRevokedError", "SessionExpiredError", "SessionPasswordNeededError",
-    "UserDeactivatedBanError", "UserDeactivatedError", "PhoneNumberBannedError",
+    "AuthKeyUnregisteredError",
+    "AuthKeyInvalidError",
+    "AuthKeyDuplicatedError",
+    "SessionRevokedError",
+    "SessionExpiredError",
+    "SessionPasswordNeededError",
+    "UserDeactivatedBanError",
+    "UserDeactivatedError",
+    "PhoneNumberBannedError",
 }
 NO_ACCESS_ERRORS = {
-    "ChannelPrivateError", "ChatAdminRequiredError", "UserNotParticipantError",
-    "InviteHashExpiredError", "InviteHashInvalidError", "ChatWriteForbiddenError",
+    "ChannelPrivateError",
+    "ChatAdminRequiredError",
+    "UserNotParticipantError",
+    "InviteHashExpiredError",
+    "InviteHashInvalidError",
+    "ChatWriteForbiddenError",
 }
 NOT_FOUND_ERRORS = {"UsernameInvalidError", "UsernameNotOccupiedError", "UsernameNotModifiedError"}
 RETRY_ERRORS = {
-    "TimeoutError", "ConnectionError", "ConnectionResetError", "ConnectionAbortedError",
-    "ConnectionRefusedError", "OSError", "IncompleteReadError", "ServerError", "TimedOutError",
-    "RpcCallFailError", "PhoneMigrateError", "NetworkMigrateError", "FileMigrateError",
+    "TimeoutError",
+    "ConnectionError",
+    "ConnectionResetError",
+    "ConnectionAbortedError",
+    "ConnectionRefusedError",
+    "OSError",
+    "IncompleteReadError",
+    "ServerError",
+    "TimedOutError",
+    "RpcCallFailError",
+    "PhoneMigrateError",
+    "NetworkMigrateError",
+    "FileMigrateError",
 }
 
 
@@ -179,11 +199,7 @@ class TelegramCollector:
         content_probe_ok = bool(probe_messages)
         known_probe_match = False
         if state and state.recent_post_keys:
-            known_ids = {
-                str(key).rsplit(":", 1)[-1]
-                for key in state.recent_post_keys
-                if ":msg:" in str(key)
-            }
+            known_ids = {str(key).rsplit(":", 1)[-1] for key in state.recent_post_keys if ":msg:" in str(key)}
             known_probe_match = any(str(message.id) in known_ids for message in probe_messages)
         items: list[CollectedItem] = []
         needs_retry = False
@@ -207,15 +223,15 @@ class TelegramCollector:
                         messages = self._keep_album_boundary(messages, self.settings.tg_batch_messages)
                         needs_retry = True
                     filtered = [
-                        message for message in messages
+                        message
+                        for message in messages
                         if (published := _utc(getattr(message, "date", None)))
                         and window_start < published <= window_end
                     ]
                     bounded_messages = [
                         message
                         for message in messages
-                        if (published := _utc(getattr(message, "date", None)))
-                        and published <= window_end
+                        if (published := _utc(getattr(message, "date", None))) and published <= window_end
                     ]
                     if bounded_messages:
                         new_watermark = max(
@@ -239,8 +255,7 @@ class TelegramCollector:
                     bounded_page = [
                         message
                         for message in page
-                        if (published := _utc(getattr(message, "date", None)))
-                        and published <= window_end
+                        if (published := _utc(getattr(message, "date", None))) and published <= window_end
                     ]
                     if bounded_page:
                         candidate_watermark = max(
@@ -280,11 +295,14 @@ class TelegramCollector:
 
         story_keys: list[str] = []
         known_story_keys = set(state.recent_story_keys or []) if state else set()
-        old_story_watermark = int(state.story_watermark or 0) if state and str(state.story_watermark).isdigit() else 0
+        old_story_watermark = (
+            int(state.story_watermark or 0) if state and str(state.story_watermark).isdigit() else 0
+        )
         max_story_id = old_story_watermark
         story_access_attempts = int((state.story_cursor or {}).get("access_attempts", 0)) if state else 0
         story_needs_retry = False
         story_cursor: dict[str, Any] = {}
+        stories: list[Any] = []
         try:
             stories = await self._collect_active_stories(client, entity)
             for story in stories:
@@ -334,6 +352,13 @@ class TelegramCollector:
                 "credential_content_probe_ok": content_probe_ok,
                 "credential_known_post_match": known_probe_match,
                 "credential_probe_ids": [int(message.id) for message in probe_messages[:10]],
+                "api_request_count": 2 + int(needs_retry) + int(bool(stories)),
+                "remote_latest_post_id": max(
+                    [int(message.id) for message in probe_messages] or [new_watermark]
+                ),
+                "remote_latest_story_id": max(
+                    [int(getattr(story, "id", 0) or 0) for story in stories] or [max_story_id]
+                ),
             },
         )
 
@@ -360,6 +385,32 @@ class TelegramCollector:
             groups.setdefault(key, []).append(message)
         return groups
 
+    @staticmethod
+    def _content_counts(messages: list[Any]) -> dict[str, int]:
+        counts: dict[str, int] = {}
+        for message in messages:
+            media = getattr(message, "media", None)
+            if getattr(message, "photo", None) is not None:
+                kind = "photo"
+            elif getattr(message, "video", None) is not None:
+                kind = "video"
+            elif getattr(message, "document", None) is not None:
+                mime = str(getattr(message.document, "mime_type", "") or "").lower()
+                if mime.startswith("video/"):
+                    kind = "video"
+                elif mime.startswith("audio/"):
+                    kind = "audio"
+                elif mime.startswith("image/"):
+                    kind = "photo"
+                else:
+                    kind = "document"
+            elif getattr(media, "webpage", None) is not None:
+                kind = "link"
+            else:
+                continue
+            counts[kind] = counts.get(kind, 0) + 1
+        return counts
+
     async def _build_post(
         self,
         client: TelegramClient,
@@ -372,7 +423,8 @@ class TelegramCollector:
         ordered = sorted(messages, key=lambda message: int(getattr(message, "id", 0) or 0))
         representative = next(
             (
-                message for message in ordered
+                message
+                for message in ordered
                 if clean_text(getattr(message, "message", "") or getattr(message, "raw_text", ""))
             ),
             ordered[0],
@@ -398,13 +450,22 @@ class TelegramCollector:
             item_key=key,
             external_id=external_id,
             original_url=f"https://t.me/{username}/{representative.id}" if username else "",
-            text=clean_text(getattr(representative, "message", "") or getattr(representative, "raw_text", "")),
+            text=clean_text(
+                getattr(representative, "message", "") or getattr(representative, "raw_text", "")
+            ),
             published_at=_utc(getattr(representative, "date", None)),
             media=media,
             raw={
                 "representative": _jsonable(representative),
                 "message_ids": [int(getattr(message, "id", 0) or 0) for message in ordered],
                 "grouped_id": str(grouped_id or ""),
+                "monitor_content_counts": self._content_counts(ordered),
+                "monitor_forward": {
+                    "is_forward": bool(getattr(representative, "fwd_from", None)),
+                    "from_name": clean_text(
+                        getattr(getattr(representative, "fwd_from", None), "from_name", "")
+                    ),
+                },
             },
         )
 
@@ -544,6 +605,15 @@ class TelegramCollector:
                 return document, message, "link_preview", mime_type.startswith("image/")
         return None, None, "", False
 
+    @staticmethod
+    def _message_duration(message: Any) -> int | None:
+        document = getattr(message, "document", None) or getattr(message, "video", None)
+        for attribute in getattr(document, "attributes", []) or []:
+            duration = getattr(attribute, "duration", None)
+            if duration:
+                return int(duration)
+        return None
+
     async def _download_message_previews(
         self,
         client: TelegramClient,
@@ -567,6 +637,14 @@ class TelegramCollector:
             )
             if not preview:
                 continue
+            if media_type == "video_preview" and getattr(self.settings, "video_preview_overlay", True):
+                duration = self._message_duration(message)
+                preview = decorate_video_preview(
+                    preview,
+                    duration=duration,
+                    index=sum(1 for row in result if row.media_type == "video_preview") + 1,
+                    total=sum(1 for row in messages if self._message_media(row)[2] == "video_preview"),
+                )
             path = target_dir / f"{len(result):02d}.jpg"
             await asyncio.to_thread(_write_preview, path, preview.data)
             result.append(
@@ -605,8 +683,7 @@ class TelegramCollector:
                     stories_api.GetStoriesByIDRequest(peer=input_peer, id=skipped_ids)
                 )
                 full = {
-                    int(getattr(story, "id", 0) or 0): story
-                    for story in self._story_items(full_response)
+                    int(getattr(story, "id", 0) or 0): story for story in self._story_items(full_response)
                 }
                 active = [full.get(int(getattr(story, "id", 0) or 0), story) for story in active]
             except Exception:
@@ -686,5 +763,11 @@ class TelegramCollector:
             published_at=_utc(getattr(story, "date", None)),
             is_pinned=False,
             media=media,
-            raw={"story": _jsonable(story), "source_kind": "active"},
+            raw={
+                "story": _jsonable(story),
+                "source_kind": "active",
+                "monitor_content_counts": {"video" if "Video" in type(media_obj).__name__ else "photo": 1}
+                if media_obj is not None
+                else {},
+            },
         )

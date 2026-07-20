@@ -204,6 +204,7 @@ async def test_vk_1116_is_dead_and_error_does_not_leak_token() -> None:
     assert "<redacted>" in str(caught.value)
     assert secret not in str(VkApiError({"error_code": 1116, "error_msg": f"token {secret} invalid"}))
 
+
 @pytest.mark.asyncio
 async def test_telegram_video_cover_is_preferred_without_video_download() -> None:
     collector = TelegramCollector(_settings())  # type: ignore[arg-type]

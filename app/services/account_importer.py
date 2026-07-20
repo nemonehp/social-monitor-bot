@@ -2,13 +2,18 @@ from __future__ import annotations
 
 import csv
 import io
-from dataclasses import dataclass
+import json
+from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
+from urllib.parse import parse_qs, urlparse
 
 
 @dataclass(slots=True)
 class VkAccountInput:
     label: str
     token: str
+    expires_at: datetime | None = None
+    config: dict[str, str | int] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
@@ -24,6 +29,45 @@ class TgAccountInput:
     lang_code: str
 
 
+def _vk_payload(value: str) -> tuple[str, datetime | None, dict[str, str | int]]:
+    payload = value.strip()
+    data: dict[str, object] = {}
+    if payload.startswith("{"):
+        parsed = json.loads(payload)
+        if not isinstance(parsed, dict):
+            raise ValueError("JSON должен быть объектом")
+        data = parsed
+    elif "access_token=" in payload:
+        parsed_url = urlparse(payload if "://" in payload else f"https://local/?{payload.lstrip('#?')}")
+        query = parse_qs(parsed_url.query)
+        fragment = parse_qs(parsed_url.fragment)
+        merged = {**query, **fragment}
+        data = {key: values[-1] for key, values in merged.items() if values}
+    else:
+        return payload, None, {}
+
+    token = str(data.get("access_token") or data.get("token") or "").strip()
+    if not token:
+        raise ValueError("не найден access_token")
+    config: dict[str, str | int] = {}
+    for key in ("user_id", "app_id", "scope"):
+        value_obj = data.get(key)
+        if value_obj not in (None, ""):
+            value_text = str(value_obj)
+            config[key] = (
+                int(value_text) if key in {"user_id", "app_id"} and value_text.isdigit() else value_text
+            )
+    expires_at: datetime | None = None
+    expires_in = data.get("expires_in")
+    if expires_in not in (None, "", "0", 0):
+        seconds = int(str(expires_in))
+        if seconds > 0:
+            expires_at = datetime.now(UTC) + timedelta(seconds=seconds)
+            config["expires_in"] = seconds
+            config["issued_at"] = datetime.now(UTC).isoformat()
+    return token, expires_at, config
+
+
 def parse_vk_accounts(text: str) -> tuple[list[VkAccountInput], list[str]]:
     result: list[VkAccountInput] = []
     errors: list[str] = []
@@ -31,15 +75,28 @@ def parse_vk_accounts(text: str) -> tuple[list[VkAccountInput], list[str]]:
         value = line.strip()
         if not value or value.startswith("#"):
             continue
-        if ";" in value:
-            label, token = [x.strip() for x in value.split(";", 1)]
-        else:
-            token = value
-            label = f"vk-{idx}"
+        label = f"vk-{idx}"
+        payload = value
+        if ";" in value and not value.startswith("{"):
+            first, rest = value.split(";", 1)
+            if "access_token=" in rest or len(rest.strip()) >= 20:
+                label, payload = first.strip() or label, rest.strip()
+        try:
+            token, expires_at, config = _vk_payload(payload)
+        except (ValueError, TypeError, json.JSONDecodeError) as exc:
+            errors.append(f"Строка {idx}: {exc}")
+            continue
         if len(token) < 20:
             errors.append(f"Строка {idx}: токен выглядит слишком коротким")
             continue
-        result.append(VkAccountInput(label=label or f"vk-{idx}", token=token))
+        result.append(
+            VkAccountInput(
+                label=label,
+                token=token,
+                expires_at=expires_at,
+                config=config,
+            )
+        )
     return result, errors
 
 

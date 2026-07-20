@@ -78,9 +78,7 @@ class AccessRepository:
     async def is_allowed(session: AsyncSession, telegram_id: int, admin_id: int) -> bool:
         if telegram_id == admin_id:
             return True
-        value = await session.scalar(
-            select(AllowedUser.active).where(AllowedUser.telegram_id == telegram_id)
-        )
+        value = await session.scalar(select(AllowedUser.active).where(AllowedUser.telegram_id == telegram_id))
         return bool(value)
 
     @staticmethod
@@ -259,9 +257,7 @@ class SourceRepository:
         return type_cast(
             Source | None,
             await session.scalar(
-                select(Source)
-                .where(Source.id == source_id)
-                .options(selectinload(Source.state))
+                select(Source).where(Source.id == source_id).options(selectinload(Source.state))
             ),
         )
 
@@ -308,9 +304,7 @@ class SourceRepository:
         if subcategory is not None:
             filters.append(Source.subcategory == subcategory)
         total = int(await session.scalar(select(func.count()).select_from(Source).where(*filters)) or 0)
-        alphabetical_key = func.lower(
-            func.coalesce(func.nullif(Source.title, ""), Source.normalized_link)
-        )
+        alphabetical_key = func.lower(func.coalesce(func.nullif(Source.title, ""), Source.normalized_link))
         order_by: tuple[Any, ...]
         if query:
             clean_query = query.strip()
@@ -476,15 +470,20 @@ class JobRepository:
         *,
         default_interval: int,
         limit: int = 1000,
+        allowed_platforms: set[Platform] | None = None,
     ) -> int:
         now = utcnow()
+        source_query = select(Source).where(
+            Source.status == SourceStatus.ACTIVE,
+            Source.next_check_at <= now,
+        )
+        if allowed_platforms is not None:
+            if not allowed_platforms:
+                return 0
+            source_query = source_query.where(Source.platform.in_(allowed_platforms))
         sources = list(
             await session.scalars(
-                select(Source)
-                .where(Source.status == SourceStatus.ACTIVE, Source.next_check_at <= now)
-                .order_by(Source.next_check_at)
-                .with_for_update(skip_locked=True)
-                .limit(limit)
+                source_query.order_by(Source.next_check_at).with_for_update(skip_locked=True).limit(limit)
             )
         )
         created = 0
@@ -514,6 +513,18 @@ class JobRepository:
             )
             created += 1
         return created
+
+    @staticmethod
+    async def defer_platform(session: AsyncSession, platform: Platform, *, delay_seconds: int) -> int:
+        result = await session.execute(
+            update(CollectionJob)
+            .where(
+                CollectionJob.platform == platform,
+                CollectionJob.status.in_([JobStatus.PENDING, JobStatus.RETRY]),
+            )
+            .values(run_after=utcnow() + timedelta(seconds=max(1, delay_seconds)))
+        )
+        return _rowcount(result)
 
     @staticmethod
     async def recover_expired(session: AsyncSession) -> int:
@@ -720,6 +731,18 @@ class ItemRepository:
 
 class DeliveryRepository:
     @staticmethod
+    async def defer_platform(session: AsyncSession, platform: Platform, *, delay_seconds: int) -> int:
+        result = await session.execute(
+            update(CollectionJob)
+            .where(
+                CollectionJob.platform == platform,
+                CollectionJob.status.in_([JobStatus.PENDING, JobStatus.RETRY]),
+            )
+            .values(run_after=utcnow() + timedelta(seconds=max(1, delay_seconds)))
+        )
+        return _rowcount(result)
+
+    @staticmethod
     async def recover_expired(session: AsyncSession) -> int:
         result = await session.execute(
             update(Delivery)
@@ -878,6 +901,7 @@ class CredentialRepository:
         label: str,
         encrypted_secret: str,
         config: dict[str, Any],
+        expires_at: datetime | None = None,
     ) -> tuple[Credential, bool]:
         existing = await session.scalar(
             select(Credential).where(Credential.platform == platform, Credential.label == label)
@@ -885,6 +909,7 @@ class CredentialRepository:
         if existing:
             existing.secret_encrypted = encrypted_secret
             existing.config_json = config
+            existing.expires_at = expires_at
             existing.status = CredentialStatus.ACTIVE
             existing.cooldown_until = None
             existing.last_error = ""
@@ -897,6 +922,7 @@ class CredentialRepository:
             label=label,
             secret_encrypted=encrypted_secret,
             config_json=config,
+            expires_at=expires_at,
             status=CredentialStatus.ACTIVE,
         )
         session.add(row)
@@ -912,6 +938,7 @@ class CredentialRepository:
             select(Credential)
             .where(
                 Credential.platform == platform,
+                or_(Credential.expires_at.is_(None), Credential.expires_at > now),
                 or_(
                     Credential.status == CredentialStatus.ACTIVE,
                     and_(
@@ -931,6 +958,7 @@ class CredentialRepository:
         credential_id: int,
         *,
         health_verified: bool = True,
+        request_count: int = 1,
     ) -> None:
         now = utcnow()
         values: dict[str, Any] = {
@@ -938,7 +966,7 @@ class CredentialRepository:
             "cooldown_until": None,
             "last_success_at": now,
             "last_error": "",
-            "requests_count": Credential.requests_count + 1,
+            "requests_count": Credential.requests_count + max(0, request_count),
             "last_health_check_at": now,
             "dead_since": None,
             "dead_notified_at": None,
@@ -951,9 +979,7 @@ class CredentialRepository:
 
     @staticmethod
     async def mark_dead(session: AsyncSession, credential_id: int, error: str) -> bool:
-        row = await session.scalar(
-            select(Credential).where(Credential.id == credential_id).with_for_update()
-        )
+        row = await session.scalar(select(Credential).where(Credential.id == credential_id).with_for_update())
         if not row:
             return False
         transitioned = row.status != CredentialStatus.DEAD
@@ -990,6 +1016,18 @@ class CredentialRepository:
         )
 
     @staticmethod
+    async def pause_for_budget(session: AsyncSession, credential_id: int, seconds: int) -> None:
+        await session.execute(
+            update(Credential)
+            .where(Credential.id == credential_id)
+            .values(
+                status=CredentialStatus.LIMITED,
+                cooldown_until=utcnow() + timedelta(seconds=max(1, seconds)),
+                last_error="safe daily API budget exhausted",
+            )
+        )
+
+    @staticmethod
     async def cooldown(
         session: AsyncSession,
         credential_id: int,
@@ -997,18 +1035,84 @@ class CredentialRepository:
         error: str,
         *,
         limited: bool = False,
+        rate_limited: bool = False,
+    ) -> None:
+        values: dict[str, Any] = {
+            "status": CredentialStatus.LIMITED if limited else CredentialStatus.COOLDOWN,
+            "cooldown_until": utcnow() + timedelta(seconds=max(1, seconds)),
+            "last_error": error[:4000],
+            "last_health_check_at": utcnow(),
+            "health_failures": Credential.health_failures + 1,
+        }
+        if rate_limited:
+            values.update(
+                rate_limit_events=Credential.rate_limit_events + 1,
+                last_rate_limit_at=utcnow(),
+            )
+        await session.execute(update(Credential).where(Credential.id == credential_id).values(**values))
+
+    @staticmethod
+    async def bind_proxy(
+        session: AsyncSession,
+        credential_id: int,
+        proxy_id: int,
+        external_ip: str,
+        epoch: str,
     ) -> None:
         await session.execute(
             update(Credential)
             .where(Credential.id == credential_id)
             .values(
-                status=CredentialStatus.LIMITED if limited else CredentialStatus.COOLDOWN,
-                cooldown_until=utcnow() + timedelta(seconds=max(1, seconds)),
-                last_error=error[:4000],
-                last_health_check_at=utcnow(),
-                health_failures=Credential.health_failures + 1,
+                assigned_proxy_id=proxy_id,
+                assigned_external_ip=external_ip[:100],
+                assignment_epoch=epoch[:64],
             )
         )
+
+    @staticmethod
+    async def unbind_credential_proxy(session: AsyncSession, credential_id: int) -> int:
+        result = await session.execute(
+            update(Credential)
+            .where(Credential.id == credential_id, Credential.platform == CredentialPlatform.VK)
+            .values(assigned_proxy_id=None, assigned_external_ip="", assignment_epoch="")
+        )
+        return _rowcount(result)
+
+    @staticmethod
+    async def unbind_proxy(session: AsyncSession, *, proxy_id: int | None = None) -> int:
+        conditions = [Credential.platform == CredentialPlatform.VK]
+        if proxy_id is not None:
+            conditions.append(Credential.assigned_proxy_id == proxy_id)
+        result = await session.execute(
+            update(Credential)
+            .where(*conditions)
+            .values(assigned_proxy_id=None, assigned_external_ip="", assignment_epoch="")
+        )
+        return _rowcount(result)
+
+    @staticmethod
+    async def expire_due(session: AsyncSession) -> int:
+        now = utcnow()
+        result = await session.execute(
+            update(Credential)
+            .where(
+                Credential.status != CredentialStatus.DEAD,
+                Credential.expires_at.is_not(None),
+                Credential.expires_at <= now,
+            )
+            .values(
+                status=CredentialStatus.DEAD,
+                cooldown_until=None,
+                last_error="known OAuth token lifetime expired",
+                last_health_check_at=now,
+                dead_since=now,
+                dead_notified_at=None,
+                assigned_proxy_id=None,
+                assigned_external_ip="",
+                assignment_epoch="",
+            )
+        )
+        return _rowcount(result)
 
     @staticmethod
     async def counts(session: AsyncSession) -> dict[str, int]:
@@ -1117,8 +1221,7 @@ class ProxyRepository:
         row.last_check_at = now
         last_known_good = row.last_success_at or (row.created_at if row.successes == 0 else None)
         failed_too_long = bool(
-            last_known_good
-            and last_known_good <= now - timedelta(hours=max(1, remove_after_hours))
+            last_known_good and last_known_good <= now - timedelta(hours=max(1, remove_after_hours))
         )
         if immediate_remove or failed_too_long:
             row.status = ProxyStatus.REMOVED
@@ -1156,7 +1259,9 @@ class AlertRepository:
             await session.flush()
             return active
         changed = row.active != active
-        cooldown_passed = not row.last_sent_at or row.last_sent_at <= now - timedelta(minutes=cooldown_minutes)
+        cooldown_passed = not row.last_sent_at or row.last_sent_at <= now - timedelta(
+            minutes=cooldown_minutes
+        )
         row.active = active
         row.payload = payload
         if active and changed:
