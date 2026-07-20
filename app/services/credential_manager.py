@@ -86,7 +86,10 @@ class CredentialManager:
             try:
                 identity = await self._resolve_vk_identity(account, routes, offset)
                 supplied_user_id = account.config.get("user_id")
-                if supplied_user_id not in (None, "") and int(supplied_user_id) != identity.user_id:
+                if (
+                    supplied_user_id not in (None, "")
+                    and int(str(supplied_user_id)) != identity.user_id
+                ):
                     raise ValueError(
                         "user_id в OAuth-ответе не совпадает с владельцем проверенного токена"
                     )

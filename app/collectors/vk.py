@@ -599,6 +599,7 @@ class VkCollector:
 
             items: list[CollectedItem] = []
             selected_posts: dict[str, dict[str, Any]] = {}
+            observed_post_ids: set[int] = set()
             found_barrier = False
             pages = 0
 
@@ -633,6 +634,7 @@ class VkCollector:
                     post_id = int(post.get("id") or 0)
                     if not post_id:
                         continue
+                    observed_post_ids.add(post_id)
                     key = f"vk:post:{post_owner}:{post_id}"
                     published = (
                         datetime.fromtimestamp(int(post.get("date") or 0), tz=UTC)
@@ -766,6 +768,7 @@ class VkCollector:
                 raw_stories = []
 
             story_keys: list[str] = []
+            observed_story_ids: set[int] = set()
             known_story_keys = set(state.recent_story_keys or []) if state else set()
             max_story_id = (
                 int(state.story_watermark or 0) if state and str(state.story_watermark).isdigit() else 0
@@ -775,6 +778,7 @@ class VkCollector:
                 story_id = int(story.get("id") or 0)
                 if not story_id:
                     continue
+                observed_story_ids.add(story_id)
                 max_story_id = max(max_story_id, story_id)
                 key = f"vk:story:{story_owner}:{story_id}"
                 if key in known_story_keys:
@@ -865,6 +869,8 @@ class VkCollector:
                 "credential_content_probe_ok": content_probe_ok,
                 "credential_known_post_match": known_probe_match,
                 "credential_probe_ids": [int(post.get("id") or 0) for post in probe_posts[:10]],
+                "observed_post_ids": sorted(observed_post_ids),
+                "observed_story_ids": sorted(observed_story_ids),
                 "api_request_count": max(2, pages + 2 + (1 if raw_stories else 0)),
                 "remote_latest_post_id": max(
                     [int(post.get("id") or 0) for post in probe_posts] or [max_post_id]

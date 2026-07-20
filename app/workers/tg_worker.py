@@ -135,6 +135,10 @@ class TgWorker:
                         worker_id,
                         self.settings.job_lease_seconds,
                     ):
+                        if not client.is_connected():
+                            raise RetryableCollectorError(
+                                "Telegram client disconnected; client restart required"
+                            )
                         result = await self.collector.collect(source, client)
                         async with SessionFactory() as session:
                             async with session.begin():
@@ -212,22 +216,47 @@ class TgWorker:
                     logger.warning("tg_credential_dead", credential_id=credential.id, error=str(exc))
                     return
                 except RetryableCollectorError as exc:
+                    error = str(exc)[:500]
+                    restart_client = (
+                        not client.is_connected()
+                        or "client restart required" in error.lower()
+                        or error.startswith("TypeNotFoundError:")
+                    )
                     async with SessionFactory() as session:
                         async with session.begin():
                             if job_id:
-                                final = bool(job and job.attempts >= self.settings.max_job_attempts)
+                                final = bool(
+                                    not restart_client
+                                    and job
+                                    and job.attempts >= self.settings.max_job_attempts
+                                )
                                 await JobRepository.retry(
                                     session,
                                     job_id,
-                                    str(exc),
+                                    error,
                                     delay_seconds=min(300, 2 ** min(8, job.attempts if job else 1)),
                                     final=final,
                                 )
                                 if source:
                                     await SourceRepository.update_after_error(
-                                        session, source.id, exc.code, str(exc)
+                                        session, source.id, exc.code, error
                                     )
-                    logger.warning("tg_retryable_error", job_id=job_id, error=str(exc))
+                            if restart_client:
+                                await CredentialRepository.cooldown(
+                                    session,
+                                    credential.id,
+                                    30,
+                                    error,
+                                )
+                    logger.warning(
+                        "tg_retryable_error",
+                        job_id=job_id,
+                        credential_id=credential.id,
+                        restart_client=restart_client,
+                        error=error,
+                    )
+                    if restart_client:
+                        return
                 except AccessDeniedError as exc:
                     async with SessionFactory() as session:
                         async with session.begin():

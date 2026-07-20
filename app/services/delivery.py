@@ -5,6 +5,7 @@ import html
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
+from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -28,6 +29,7 @@ from aiogram.types import (
     InputMediaLivePhoto,
     InputMediaPhoto,
     InputMediaVideo,
+    ReplyParameters,
 )
 
 from app.config import Settings
@@ -43,6 +45,34 @@ from app.utils.text import h, split_text, vk_text_to_html
 
 logger = structlog.get_logger()
 MOSCOW = ZoneInfo("Europe/Moscow")
+CAPTION_MAX_UTF16_UNITS = 1024
+
+
+class _VisibleHTMLParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.parts: list[str] = []
+
+    def handle_data(self, data: str) -> None:
+        self.parts.append(data)
+
+
+def _visible_html_text(value: str) -> str:
+    parser = _VisibleHTMLParser()
+    try:
+        parser.feed(value)
+        parser.close()
+    except Exception:
+        return html.unescape(value)
+    return "".join(parser.parts)
+
+
+def _utf16_units(value: str) -> int:
+    return sum(2 if ord(char) > 0xFFFF else 1 for char in value)
+
+
+def _fits_caption(value: str) -> bool:
+    return _utf16_units(_visible_html_text(value)) <= CAPTION_MAX_UTF16_UNITS
 
 
 @asynccontextmanager
@@ -267,94 +297,202 @@ class DeliveryWorker:
         cards: list[str],
         *,
         thread_id: int | None,
+        reply_to_message_id: int | None = None,
     ) -> list[int]:
         message_ids: list[int] = []
         keyboard = self._keyboard(delivery)
         for index, card in enumerate(cards):
+            reply_parameters = (
+                ReplyParameters(
+                    message_id=reply_to_message_id,
+                    allow_sending_without_reply=True,
+                )
+                if reply_to_message_id is not None and index == 0
+                else None
+            )
             message = await self.bot.send_message(
                 delivery.target_chat_id,
                 card,
                 message_thread_id=thread_id,
                 reply_markup=keyboard if index == len(cards) - 1 else None,
                 disable_web_page_preview=True,
+                reply_parameters=reply_parameters,
             )
             message_ids.append(message.message_id)
         return message_ids
+
+    @staticmethod
+    def _append_notice(cards: list[str], notice: str) -> list[str]:
+        result = list(cards)
+        if not result:
+            return [notice]
+        result[-1] = f"{result[-1]}\n\n{notice}"
+        return result
+
+    @staticmethod
+    def _reply_parameters(message_id: int | None) -> ReplyParameters | None:
+        if message_id is None:
+            return None
+        return ReplyParameters(message_id=message_id, allow_sending_without_reply=True)
+
+    async def _send_media(
+        self,
+        delivery: Delivery,
+        media: list[Media],
+        *,
+        thread_id: int | None,
+        caption: str | None,
+        reply_to_message_id: int | None,
+    ) -> tuple[list[int], TelegramBadRequest | None]:
+        message_ids: list[int] = []
+        reply_parameters = self._reply_parameters(reply_to_message_id)
+        for start in range(0, len(media), 10):
+            chunk = media[start : start + 10]
+            is_first = start == 0
+            chunk_caption = caption if is_first else None
+            chunk_reply = reply_parameters if is_first else None
+            try:
+                if len(chunk) == 1:
+                    row = chunk[0]
+                    file = FSInputFile(row.local_path)
+                    reply_markup = self._keyboard(delivery) if chunk_caption else None
+                    common: dict[str, Any] = {
+                        "message_thread_id": thread_id,
+                        "caption": chunk_caption,
+                        "reply_markup": reply_markup,
+                        "reply_parameters": chunk_reply,
+                    }
+                    if row.media_type == "video":
+                        message = await self.bot.send_video(
+                            delivery.target_chat_id,
+                            video=file,
+                            supports_streaming=True,
+                            **common,
+                        )
+                    elif row.media_type in {"document", "audio"}:
+                        message = await self.bot.send_document(
+                            delivery.target_chat_id,
+                            document=file,
+                            **common,
+                        )
+                    else:
+                        message = await self.bot.send_photo(
+                            delivery.target_chat_id,
+                            photo=file,
+                            **common,
+                        )
+                    message_ids.append(message.message_id)
+                    continue
+
+                media_group: list[
+                    InputMediaAudio
+                    | InputMediaDocument
+                    | InputMediaLivePhoto
+                    | InputMediaPhoto
+                    | InputMediaVideo
+                ] = [
+                    self._input_media(
+                        row,
+                        caption=chunk_caption if index == 0 else None,
+                    )
+                    for index, row in enumerate(chunk)
+                ]
+                sent = await self.bot.send_media_group(
+                    delivery.target_chat_id,
+                    media=media_group,
+                    message_thread_id=thread_id,
+                    reply_parameters=chunk_reply,
+                )
+                message_ids.extend(message.message_id for message in sent)
+            except TelegramBadRequest as exc:
+                return message_ids, exc
+        return message_ids, None
 
     async def _send(self, delivery: Delivery) -> list[int]:
         media = self._existing_media(delivery.item.media)
         cards = self._cards(delivery, media)
         thread_id = await self._thread_id(delivery)
-        message_ids: list[int] = []
-        # A single compact card fits safely into a Telegram media caption. Longer
-        # text is deliberately sent once after media and never duplicated.
-        compact_caption = cards[0] if len(cards) == 1 and len(cards[0]) <= 950 else None
-        if media:
-            try:
-                for start in range(0, len(media), 10):
-                    chunk = media[start : start + 10]
-                    is_first = start == 0
-                    caption = compact_caption if is_first else None
-                    if len(chunk) == 1:
-                        row = chunk[0]
-                        file = FSInputFile(row.local_path)
-                        reply_markup = self._keyboard(delivery) if caption else None
-                        if row.media_type == "video":
-                            message = await self.bot.send_video(
-                                delivery.target_chat_id,
-                                video=file,
-                                supports_streaming=True,
-                                message_thread_id=thread_id,
-                                caption=caption,
-                                reply_markup=reply_markup,
-                            )
-                        elif row.media_type in {"document", "audio"}:
-                            message = await self.bot.send_document(
-                                delivery.target_chat_id,
-                                document=file,
-                                message_thread_id=thread_id,
-                                caption=caption,
-                                reply_markup=reply_markup,
-                            )
-                        else:
-                            message = await self.bot.send_photo(
-                                delivery.target_chat_id,
-                                photo=file,
-                                message_thread_id=thread_id,
-                                caption=caption,
-                                reply_markup=reply_markup,
-                            )
-                        message_ids.append(message.message_id)
-                    else:
-                        media_group: list[
-                            InputMediaAudio
-                            | InputMediaDocument
-                            | InputMediaLivePhoto
-                            | InputMediaPhoto
-                            | InputMediaVideo
-                        ] = [
-                            self._input_media(
-                                row,
-                                caption=caption if index == 0 else None,
-                            )
-                            for index, row in enumerate(chunk)
-                        ]
-                        sent = await self.bot.send_media_group(
-                            delivery.target_chat_id,
-                            media=media_group,
-                            message_thread_id=thread_id,
-                        )
-                        message_ids.extend(message.message_id for message in sent)
-            except TelegramBadRequest as exc:
-                error = str(exc).lower()
-                if thread_id and ("thread" in error or "topic" in error) and not message_ids:
-                    key = topic_key(delivery.item.platform, delivery.item.item_type)
-                    replacement = await recreate_topic(self.bot, delivery.target_chat_id, key)
-                    if replacement:
-                        return await self._send(delivery)
-                logger.warning("delivery_media_fallback", delivery_id=delivery.id, error=str(exc))
-        if compact_caption is None or not media:
-            message_ids.extend(await self._send_cards(delivery, cards, thread_id=thread_id))
+        compact_caption = cards[0] if len(cards) == 1 and _fits_caption(cards[0]) else None
+        text_message_ids: list[int] = []
+        media_message_ids: list[int] = []
+
+        # The deterministic layout is always the same:
+        # 1. If the full card fits Telegram's parsed-caption limit, it is attached
+        #    to the first media item/album element.
+        # 2. Otherwise the complete text is sent first and media replies to it.
+        # 3. If media cannot be sent, text is still delivered with an explicit notice.
+        if not media:
+            return await self._send_cards(delivery, cards, thread_id=thread_id)
+
+        if compact_caption is None:
+            text_message_ids = await self._send_cards(delivery, cards, thread_id=thread_id)
+
+        media_message_ids, media_error = await self._send_media(
+            delivery,
+            media,
+            thread_id=thread_id,
+            caption=compact_caption,
+            reply_to_message_id=text_message_ids[0] if text_message_ids else None,
+        )
+        if media_error is not None:
+            exc = media_error
+            error = str(exc).lower()
+            if thread_id and ("thread" in error or "topic" in error) and not text_message_ids:
+                key = topic_key(delivery.item.platform, delivery.item.item_type)
+                replacement = await recreate_topic(self.bot, delivery.target_chat_id, key)
+                if replacement:
+                    return await self._send(delivery)
+
+            logger.warning(
+                "delivery_media_fallback",
+                delivery_id=delivery.id,
+                error=str(exc),
+                text_sent=bool(text_message_ids or media_message_ids),
+                media_sent=len(media_message_ids),
+                media_total=len(media),
+            )
+            warning = (
+                "⚠️ <b>Часть вложений не удалось приложить.</b>"
+                if media_message_ids
+                else "⚠️ <b>Вложения не удалось приложить.</b>"
+            )
+            anchor_id = (
+                text_message_ids[0]
+                if text_message_ids
+                else (media_message_ids[0] if media_message_ids else None)
+            )
+            if compact_caption is not None and not media_message_ids:
+                text_message_ids = await self._send_cards(
+                    delivery,
+                    self._append_notice(cards, warning),
+                    thread_id=thread_id,
+                )
+            else:
+                text_message_ids.extend(
+                    await self._send_cards(
+                        delivery,
+                        [warning],
+                        thread_id=thread_id,
+                        reply_to_message_id=anchor_id,
+                    )
+                )
+
+        message_ids = (
+            media_message_ids + text_message_ids
+            if compact_caption is not None
+            else text_message_ids + media_message_ids
+        )
+        logger.info(
+            "delivery_layout",
+            delivery_id=delivery.id,
+            layout="caption" if compact_caption is not None else "text_then_media",
+            caption_utf16_units=(
+                _utf16_units(_visible_html_text(compact_caption)) if compact_caption is not None else None
+            ),
+            text_messages=len(text_message_ids),
+            media_messages=len(media_message_ids),
+            media_total=len(media),
+        )
         return message_ids
 
     async def _process_delivery(self, delivery: Delivery, lease_ids: list[int]) -> tuple[bool, int]:

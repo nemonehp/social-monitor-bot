@@ -25,7 +25,7 @@ def test_delivery_never_mutates_frozen_media_models() -> None:
     source = Path("app/services/delivery.py").read_text(encoding="utf-8")
     assert "media_group[0].caption =" not in source
     assert "media_group[0].parse_mode =" not in source
-    assert "caption=caption if index == 0 else None" in source
+    assert "caption=chunk_caption if index == 0 else None" in source
 
 
 def test_unexpected_delivery_failures_use_bounded_backoff() -> None:

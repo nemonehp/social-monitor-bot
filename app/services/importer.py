@@ -165,6 +165,8 @@ def parse_xlsx(path: Path) -> ImportPreview:
     workbook = load_workbook(path, read_only=True, data_only=True)
     sheet = workbook.active
     try:
+        if sheet is None:
+            raise ValueError("XLSX workbook has no active worksheet")
         return _parse_rows(list(row) for row in sheet.iter_rows(values_only=True))
     finally:
         workbook.close()

@@ -149,9 +149,10 @@ async def test_long_single_media_post_does_not_repeat_text_in_caption(tmp_path: 
 
     message_ids = await worker._send(delivery)  # type: ignore[arg-type]
 
-    assert message_ids == [101, 102]
+    assert message_ids == [102, 101]
     assert len(worker.bot.photo_calls) == 1  # type: ignore[attr-defined]
     assert worker.bot.photo_calls[0]["caption"] is None  # type: ignore[attr-defined]
+    assert worker.bot.photo_calls[0]["reply_parameters"].message_id == 102  # type: ignore[attr-defined]
     assert len(worker.bot.message_calls) == 1  # type: ignore[attr-defined]
     assert worker.bot.message_calls[0]["text"].count("Длинный текст") > 1  # type: ignore[attr-defined]
 

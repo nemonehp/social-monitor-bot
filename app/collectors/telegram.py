@@ -44,6 +44,10 @@ NO_ACCESS_ERRORS = {
     "ChatWriteForbiddenError",
 }
 NOT_FOUND_ERRORS = {"UsernameInvalidError", "UsernameNotOccupiedError", "UsernameNotModifiedError"}
+CLIENT_RESTART_ERRORS = {
+    "TypeNotFoundError",
+    "InvalidBufferError",
+}
 RETRY_ERRORS = {
     "TimeoutError",
     "ConnectionError",
@@ -65,19 +69,41 @@ def _exc_name(exc: BaseException) -> str:
     return type(exc).__name__
 
 
+def _safe_exception_text(exc: BaseException, *, limit: int = 500) -> str:
+    name = _exc_name(exc)
+    # Telethon's TypeNotFoundError may include the entire undecoded binary buffer
+    # in __str__. That buffer is noisy and can contain session-adjacent payload
+    # bytes, so never render it into logs or database error fields.
+    if name in CLIENT_RESTART_ERRORS:
+        return f"{name}: Telegram payload decode failed; client restart required"
+    try:
+        value = str(exc)
+    except Exception:
+        value = "unprintable exception"
+    value = value.replace("\x00", "")
+    if len(value) > limit:
+        value = value[:limit].rstrip() + "…"
+    return value
+
+
 def _classify(exc: BaseException) -> Exception:
     name = _exc_name(exc)
+    message = _safe_exception_text(exc)
     if name in BAD_SESSION_ERRORS:
-        return CredentialDeadError(str(exc))
+        return CredentialDeadError(message)
     if name in NO_ACCESS_ERRORS:
-        return AccessDeniedError(str(exc))
+        return AccessDeniedError(message)
     if name in NOT_FOUND_ERRORS:
-        return NotFoundError(str(exc))
+        return NotFoundError(message)
     if name == "FloodWaitError":
-        return RateLimitedError(str(exc), retry_after=int(getattr(exc, "seconds", 60) or 60))
-    if name in RETRY_ERRORS or isinstance(exc, (asyncio.TimeoutError, ConnectionError, OSError)):
-        return NetworkCollectorError(str(exc))
-    return RetryableCollectorError(f"{name}: {exc}")
+        return RateLimitedError(message, retry_after=int(getattr(exc, "seconds", 60) or 60))
+    if (
+        name in RETRY_ERRORS
+        or name in CLIENT_RESTART_ERRORS
+        or isinstance(exc, (asyncio.TimeoutError, ConnectionError, OSError))
+    ):
+        return NetworkCollectorError(message)
+    return RetryableCollectorError(f"{name}: {message}")
 
 
 def _entity_type(entity: Any) -> str:
@@ -207,6 +233,7 @@ class TelegramCollector:
         new_watermark = old_watermark
         post_cursor = dict(state.post_cursor or {}) if state else {}
         post_keys: list[str] = []
+        observed_post_ids: set[int] = set()
 
         if entity_type not in {"user", "bot"}:
             try:
@@ -233,6 +260,10 @@ class TelegramCollector:
                         for message in messages
                         if (published := _utc(getattr(message, "date", None))) and published <= window_end
                     ]
+                    observed_post_ids.update(
+                        int(getattr(message, "id", 0) or 0) for message in bounded_messages
+                    )
+                    observed_post_ids.discard(0)
                     if bounded_messages:
                         new_watermark = max(
                             new_watermark,
@@ -257,6 +288,8 @@ class TelegramCollector:
                         for message in page
                         if (published := _utc(getattr(message, "date", None))) and published <= window_end
                     ]
+                    observed_post_ids.update(int(getattr(message, "id", 0) or 0) for message in bounded_page)
+                    observed_post_ids.discard(0)
                     if bounded_page:
                         candidate_watermark = max(
                             candidate_watermark,
@@ -303,8 +336,11 @@ class TelegramCollector:
         story_needs_retry = False
         story_cursor: dict[str, Any] = {}
         stories: list[Any] = []
+        observed_story_ids: set[int] = set()
         try:
             stories = await self._collect_active_stories(client, entity)
+            observed_story_ids.update(int(getattr(story, "id", 0) or 0) for story in stories)
+            observed_story_ids.discard(0)
             for story in stories:
                 story_id = int(getattr(story, "id", 0) or 0)
                 max_story_id = max(max_story_id, story_id)
@@ -352,6 +388,8 @@ class TelegramCollector:
                 "credential_content_probe_ok": content_probe_ok,
                 "credential_known_post_match": known_probe_match,
                 "credential_probe_ids": [int(message.id) for message in probe_messages[:10]],
+                "observed_post_ids": sorted(observed_post_ids),
+                "observed_story_ids": sorted(observed_story_ids),
                 "api_request_count": 2 + int(needs_retry) + int(bool(stories)),
                 "remote_latest_post_id": max(
                     [int(message.id) for message in probe_messages] or [new_watermark]

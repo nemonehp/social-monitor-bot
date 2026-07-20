@@ -26,11 +26,19 @@ def _as_int(value: object) -> int:
         return 0
 
 
+def _diagnostic_ids(value: object) -> set[int]:
+    if not isinstance(value, (list, tuple, set)):
+        return set()
+    result = {_as_int(item) for item in value}
+    result.discard(0)
+    return result
+
+
 def _next_consecutive_gap(value: object) -> int:
     """Increment an ORM counter safely before SQLAlchemy insert defaults are applied."""
 
     try:
-        return max(0, int(value or 0)) + 1
+        return max(0, _as_int(value)) + 1
     except (TypeError, ValueError):
         return 1
 
@@ -56,6 +64,23 @@ def _result_contains(result: CollectionResult, item_type: ItemType, remote_id: i
     return any(
         item.item_type == item_type and remote_id in _item_ids(item.external_id, item.raw)
         for item in result.items
+    )
+
+
+def _remote_is_missing(
+    *,
+    first_run: bool,
+    remote_id: int,
+    state_id: int,
+    stored_id: int,
+    stored_ids: set[int],
+    remote_observed: bool,
+) -> bool:
+    return (
+        not first_run
+        and remote_id > max(state_id, stored_id)
+        and remote_id not in stored_ids
+        and not remote_observed
     )
 
 
@@ -91,21 +116,33 @@ async def assess_collection_integrity(
     stored_story = max(story_ids, default=0)
     state_post = _as_int(source.state.post_watermark if source.state else 0)
     state_story = _as_int(source.state.story_watermark if source.state else 0)
+    observed_post_ids = _diagnostic_ids(result.diagnostics.get("observed_post_ids"))
+    observed_story_ids = _diagnostic_ids(result.diagnostics.get("observed_story_ids"))
+    remote_post_observed = remote_post in observed_post_ids or _result_contains(
+        result, ItemType.POST, remote_post
+    )
+    remote_story_observed = remote_story in observed_story_ids or _result_contains(
+        result, ItemType.STORY, remote_story
+    )
 
     # The first pass intentionally establishes a baseline without importing old
     # history. Comparing that baseline with an empty database would be a false gap.
     first_run = bool(result.diagnostics.get("first_run"))
-    post_gap = (
-        not first_run
-        and remote_post > max(state_post, stored_post)
-        and remote_post not in post_ids
-        and not _result_contains(result, ItemType.POST, remote_post)
+    post_gap = _remote_is_missing(
+        first_run=first_run,
+        remote_id=remote_post,
+        state_id=state_post,
+        stored_id=stored_post,
+        stored_ids=post_ids,
+        remote_observed=remote_post_observed,
     )
-    story_gap = (
-        not first_run
-        and remote_story > max(state_story, stored_story)
-        and remote_story not in story_ids
-        and not _result_contains(result, ItemType.STORY, remote_story)
+    story_gap = _remote_is_missing(
+        first_run=first_run,
+        remote_id=remote_story,
+        state_id=state_story,
+        stored_id=stored_story,
+        stored_ids=story_ids,
+        remote_observed=remote_story_observed,
     )
     suspected = post_gap or story_gap
     details: dict[str, object] = {
@@ -118,6 +155,10 @@ async def assess_collection_integrity(
         "state_story_id": state_story,
         "post_gap": post_gap,
         "story_gap": story_gap,
+        "remote_post_observed": remote_post_observed,
+        "remote_story_observed": remote_story_observed,
+        "observed_post_count": len(observed_post_ids),
+        "observed_story_count": len(observed_story_ids),
     }
     row = await session.get(IntegrityCheck, source.id)
     if row is None:
